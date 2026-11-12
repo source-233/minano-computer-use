@@ -64,6 +64,36 @@ def test_parity_trace_never_serializes_commands_or_clipboard(tmp_path, operation
         store.close()
 
 
+def test_v04_state_and_message_trace_omit_control_values_and_selections(tmp_path):
+    store = ArtifactStore(tmp_path)
+    trace = TraceRecorder(store, enabled=True)
+    secret = "private-selected-control-text"
+    try:
+        for operation, delivery in (("window", "read_only"), ("act", "message")):
+            trace.record(
+                operation,
+                {"action": "state", "input_mode": "message", "value": secret},
+                {
+                    "status": "partial",
+                    "delivery": delivery,
+                    "data": {
+                        "uia": {"nodes": [{"value": secret}], "selection": {"ranges": [secret]}},
+                        "after": {"focus": {"element": {"name": secret}}},
+                    },
+                },
+            )
+        records = list(store.root.glob("*.jsonl"))
+        assert len(records) == 2
+        for path in records:
+            wire = path.read_text()
+            assert secret not in wire
+            event = json.loads(wire)
+            assert "data" not in event and event["status"] == "partial"
+    finally:
+        trace.close()
+        store.close()
+
+
 def test_quota_removes_only_registered_owned_files(tmp_path):
     untouched = tmp_path / "important.mp4"
     untouched.write_text("do not delete")

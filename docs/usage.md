@@ -1,7 +1,84 @@
 # 调用例子
 
+0.4 增加后台消息和完整应用状态，接口约束见 [v0.4.md](v0.4.md)。省略 input_mode
+时仍兼容 native=false/true；显式 input_mode="uia"/"native"/"message" 选择本次通道，
+不需要修改服务启动参数。
+
 这是 MCP 工具参数，不是终端命令。名称取决于应用语言；先列窗口再读树。
 工具 schema 以 MCP `list_tools` 的结果为准。
+
+## 0.4：三种输入通道
+
+| 选择 | 行为 | 前台要求 |
+|---|---|---|
+| 不传 input_mode，native=false（默认）或 input_mode="uia" | 直接调用 UIA Pattern | 不主动聚焦，provider 仍可能有副作用 |
+| native=true 或 input_mode="native" | 真实键鼠/原生输入 | 目标必须在前台；显式 force_focus 可请求切窗 |
+| input_mode="message" | 只向绑定窗口或同进程子控件发送固定 Win32 消息 | 不要求前台，不移动真实指针，不调用聚焦 API |
+
+显式 input_mode 即单次选择，不需要额外 native=true。将 native=true 与明确的
+uia/message 模式混用会拒绝，不能逐项切换模式。默认 UIA 失败不自动改走消息或真实键鼠。
+
+后台写入标准 Edit 的完整值：
+
+```json
+{
+  "target":"hwnd:0x123456",
+  "input_mode":"message",
+  "actions":[
+    {"action":"set_value","recipient":"hwnd:0x123457","value":"hello"}
+  ]
+}
+```
+
+recipient 是目标根窗口或同进程子控件 HWND。消息通道明确绑定根 HWND、PID、
+进程创建时间，收件控件必须属于该根；不存在、跨进程或歧义目标拒绝。
+按键/文字未给 recipient 时，仅使用目标 GUI 线程内部的焦点子控件或根窗口，
+不借用全局前台控件。文本经 WM_CHAR 投递；set_value 仅在已支持的标准输入框上
+执行完整值替换并回读，不等同 UIA SetValue。
+
+后台鼠标仍要给出目标窗口内的物理屏幕坐标，或使用同调用者最新有效 capture_id
+映射 image 坐标。它在目标窗口内部选择接收控件并换算客户区坐标，不使用真实
+鼠标命中，也不穿透到其他进程。move/click/drag/wheel 的消息不是系统真实输入；
+目标应用可能忽略、重解释或自行聚焦，返回 invoked 不保证应用接受。
+本工具的后台有效载荷统一使用有时限的同步消息投递，避免异步文字在后续完整值
+替换之后才处理；窗口过程返回仍不等于应用业务完成，不承诺系统消息队列原子性。
+相对 look、force_focus、paste 不属于后台消息动作，整批在执行前拒绝。
+
+消息通道默认后置反馈是同窗口的 UIA 状态与可选截图。反馈不会重新发现同名窗口，
+也不重试写操作。取消/超时后可能已有消息入队；工作进程被硬终止时不能声称其
+按键松开 finally 已执行，结果会保留不确定性和未确认清理。
+
+## 0.4：完整应用状态与控件信息
+
+```json
+{
+  "action":"state",
+  "target":"hwnd:0x123456",
+  "include_ax":true,
+  "include_screenshot":true,
+  "rich":true,
+  "text_limit":500,
+  "depth":8,
+  "max_nodes":500,
+  "max_dim":800,
+  "format":"jpeg",
+  "quality":75
+}
+```
+
+返回的 data.uia 包含控件、目标内焦点与选区；data.screenshot 是图像元数据，
+图片仍是独立 MCP image 内容。state 不主动切到前台。两个组件绑定相同根窗口
+身份，并有各自时间及 component_errors；consistency="non_atomic" 明确不是同帧。
+一方失败仍保留另一方，整体报告 partial，而不是全部成功。
+
+关闭 include_ax 可完全跳过 UIA，关闭 include_screenshot 不取图；二者不能都关。
+全局前台窗口和目标内 UIA 焦点是不同概念，焦点不属于目标时不会泄漏别的应用内容。
+选区只从已证明属于目标的控件读出；未知、无焦点或不支持时明确标注 unavailable。
+
+tree/text/find/inspect 可指定 rich=true，查看类名、原生 HWND、启用/离屏/焦点状态、
+矩形、当前值和 actions 提示。每个可选属性的读取失败分别报告，不用 false 冒充
+不可读取。provider 的屏幕坐标不自动等于可安全点击的物理坐标；几何信息不启用
+物理回退。密码值、密码文字和密码选区不明文返回；无法判断敏感性时保守省略。
 
 ## 窗口与控件
 

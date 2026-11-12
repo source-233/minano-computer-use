@@ -34,6 +34,12 @@ class Control:
     def __init__(self, name, *, pid=20, children=(), patterns=None, auto=None, control_type=1):
         self.Name, self.AutomationId, self.ControlType = name, name.lower(), control_type
         self.ControlTypeName, self.ProcessId = "ButtonControl", pid
+        self.IsPassword = False
+        self.ClassName, self.LocalizedControlType = "FakeControl", "button"
+        self.NativeWindowHandle = 10
+        self.IsEnabled, self.IsOffscreen = True, False
+        self.HasKeyboardFocus, self.IsKeyboardFocusable = False, True
+        self.BoundingRectangle = NS(left=1, top=2, right=30, bottom=40)
         self.children, self.patterns = list(children), patterns or {}
         self.auto = auto
         self.parent = None

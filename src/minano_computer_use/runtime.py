@@ -41,6 +41,12 @@ def _limits(action):
                 raise ValueError(f"{field} must be an integer in [{low}, {high}]")
 
 
+def _unsupported_fields(name, request, allowed):
+    unknown = set(request) - allowed
+    if unknown:
+        raise ValueError(f"Unsupported {name} arguments: {sorted(unknown)}")
+
+
 class Runtime:
     def __init__(
         self,
@@ -56,6 +62,7 @@ class Runtime:
         allow_process_control=False,
         services=None,
         coordinate_manager=None,
+        message=None,
     ):
         # Deprecated constructor switch: permission is selected per call only.
         self.allow_native = True
@@ -65,6 +72,7 @@ class Runtime:
         self._coordinate_manager = coordinate_manager
         self._broker = broker
         self._native = native
+        self._message = message
         self._capture = capture
         self._output_dir = output_dir
         self._lock = threading.RLock()
@@ -267,6 +275,28 @@ class Runtime:
             self._native = NativeInput(enabled=True, services=self._automation())
         return self._native
 
+    def _background(self):
+        if self._message is None:
+            from .message_backend import BackgroundInput
+
+            self._message = BackgroundInput()
+        return self._message
+
+    @staticmethod
+    def _input_mode(native, input_mode, key_method):
+        if type(native) is not bool:
+            raise ValueError("native must be a boolean")
+        if input_mode is not None and input_mode not in {"uia", "native", "message"}:
+            raise ValueError("input_mode must be uia, native, or message")
+        if native and input_mode in {"uia", "message"}:
+            raise ValueError("native=true conflicts with explicit input_mode")
+        mode = input_mode or ("native" if native else "uia")
+        if key_method not in {"auto", "scancode", "message"}:
+            raise ValueError("key_method must be auto, scancode, or message")
+        if mode == "message" and key_method != "scancode":
+            raise ValueError("message input_mode requires default key_method")
+        return mode
+
     def _automation(self):
         if self._services is None:
             from .automation_services import AutomationServices
@@ -367,7 +397,16 @@ class Runtime:
             status, operation, code=getattr(exc, "code", "INVALID_ARGUMENT"), message=str(exc)
         )
 
-    def window(self, action="list", target=None, selector=None, *, _request_cancel=None, **kwargs):
+    def window(
+        self,
+        action="list",
+        target=None,
+        selector=None,
+        *,
+        scope="default",
+        _request_cancel=None,
+        **kwargs,
+    ):
         alias = action
         window_target = kwargs.pop("window", None)
         if window_target is not None:
@@ -406,6 +445,18 @@ class Runtime:
         request = dict(action=action, target=target, selector=selector, **kwargs)
 
         def execute(operation):
+            if action == "state":
+                allowed = set(inspect.signature(self._window_state).parameters) - {
+                    "binding",
+                    "deadline",
+                    "operation",
+                    "scope",
+                    "target",
+                }
+                _unsupported_fields("state", kwargs, allowed)
+                return self._window_state(
+                    target, operation, scope=scope, selector=selector, **kwargs
+                )
             if action in {"focus", "force_focus"}:
                 prepared = self._validate_actions(
                     [{"action": action}],
@@ -492,11 +543,206 @@ class Runtime:
 
         return self._execute(
             "window",
-            request,
+            {
+                **request,
+                "capture_artifacts": action == "state" and kwargs.get("include_screenshot", True),
+            },
             execute,
-            "read_only" if action in READ_ACTIONS else "accessibility",
+            "read_only" if action in READ_ACTIONS or action == "state" else "accessibility",
             _request_cancel,
         )
+
+    @staticmethod
+    def _remaining(deadline, operation):
+        operation.checkpoint()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Application state deadline elapsed")
+        return remaining
+
+    @staticmethod
+    def _verify_binding(binding, observed=None):
+        from . import win32
+
+        current = win32.window_identity(binding["hwnd"], binding["pid"])
+        for candidate in (current, observed):
+            if candidate is not None and any(
+                candidate.get(key) != binding[key]
+                for key in ("hwnd", "pid", "process_creation_time")
+            ):
+                raise win32.TargetError("STALE_TARGET", "Application state binding changed")
+
+    @staticmethod
+    def _state_observations():
+        from . import win32
+
+        try:
+            return win32.observations()
+        except Exception as exc:
+            return {"status": "unavailable", "error_type": type(exc).__name__}
+
+    def _window_state(
+        self,
+        target,
+        operation,
+        *,
+        include_ax=True,
+        include_screenshot=True,
+        rich=True,
+        text_limit=500,
+        max_dim=800,
+        format="jpeg",
+        quality=75,
+        timeout=5.0,
+        depth=8,
+        max_nodes=500,
+        max_output_chars=24000,
+        max_output_bytes=65536,
+        compact=False,
+        include_tokens=False,
+        selector=None,
+        token=None,
+        scope="default",
+        deadline=None,
+        binding=None,
+    ):
+        from . import win32
+
+        _target(target)
+        self._validate_selector(selector)
+        if token is not None and (not isinstance(token, str) or not token or selector is not None):
+            raise ValueError("state token must be nonempty and mutually exclusive with selector")
+        for name, value in (
+            ("include_ax", include_ax),
+            ("include_screenshot", include_screenshot),
+            ("rich", rich),
+            ("compact", compact),
+            ("include_tokens", include_tokens),
+        ):
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        if not include_ax and not include_screenshot:
+            raise ValueError("state requires include_ax or include_screenshot")
+        _limits({"depth": depth, "max_nodes": max_nodes})
+        _number(timeout, "timeout", 0.001, 120)
+        validate_budget(max_output_chars, max_output_bytes)
+        if type(text_limit) is not int or not 1 <= text_limit <= 4096:
+            raise ValueError("text_limit must be an integer in [1, 4096]")
+        if type(max_dim) is not int or not 0 <= max_dim <= 4096:
+            raise ValueError("max_dim must be an integer in [0, 4096]")
+        if not isinstance(format, str) or format.lower() not in {"png", "jpeg", "jpg", "webp"}:
+            raise ValueError("format must be png, jpeg, or webp")
+        if quality is not None and (type(quality) is not int or not 1 <= quality <= 95):
+            raise ValueError("quality must be an integer in [1, 95]")
+        began = time.monotonic()
+        deadline = min(deadline, began + timeout) if deadline is not None else began + timeout
+        self._remaining(deadline, operation)
+        if binding is None:
+            window = win32.resolve_window(target)
+            binding = win32.window_identity(window["hwnd"], window["pid"])
+        else:
+            self._verify_binding(binding)
+        if binding.get("process_creation_time") is None:
+            raise win32.TargetError("BINDING_UNAVAILABLE", "Process creation identity unavailable")
+        exact = f"hwnd:{binding['hwnd']}"
+        before = self._state_observations()
+        data = {"consistency": "non_atomic", "component_errors": {}, "target_binding": binding}
+        frame = None
+        for component, enabled in (("uia", include_ax), ("screenshot", include_screenshot)):
+            if not enabled:
+                continue
+            started = time.monotonic()
+            try:
+                remaining = self._remaining(deadline, operation)
+                self._verify_binding(binding)
+                if component == "uia":
+                    request = dict(
+                        action="state",
+                        target=exact,
+                        target_binding=binding,
+                        rich=rich,
+                        text_limit=text_limit,
+                        depth=depth,
+                        max_nodes=max_nodes,
+                        compact=compact,
+                        include_tokens=include_tokens,
+                        selector=selector,
+                        token=token,
+                        timeout=remaining,
+                        max_output_chars=max_output_chars,
+                        max_output_bytes=max_output_bytes,
+                    )
+                    observed = self._broker_call(self._uia(), request, remaining, operation.event)
+                    if observed.get("status") != "ok":
+                        data["component_errors"][component] = observed
+                        continue
+                    root = observed.get("target_binding") or observed.get("data", {}).get(
+                        "root_binding"
+                    )
+                    if not isinstance(root, dict):
+                        raise ValueError("UIA state returned no root binding")
+                    self._verify_binding(binding, root)
+                    data[component] = observed.get("data")
+                else:
+                    captured = self._camera().screenshot(
+                        target=exact,
+                        cancel_event=operation.event,
+                        scope=scope,
+                        timeout=remaining,
+                        deadline=deadline,
+                        max_dim=max_dim,
+                        format=format,
+                        quality=quality,
+                    )
+                    if isinstance(captured, dict):
+                        data["component_errors"][component] = captured
+                        continue
+                    self._verify_binding(binding, captured.metadata)
+                    frame = captured
+                    data[component] = captured.metadata
+                self._remaining(deadline, operation)
+            except Exception as exc:
+                data.pop(component, None)
+                if component == "screenshot":
+                    frame = None
+                data["component_errors"][component] = self._failure(component, exc, "error")
+            finally:
+                data.setdefault("component_times", {})[component] = {
+                    "started_at": started,
+                    "finished_at": time.monotonic(),
+                }
+        try:
+            self._verify_binding(binding)
+        except Exception as exc:
+            # Neither component can be trusted as belonging to the original root.
+            data.pop("uia", None)
+            data.pop("screenshot", None)
+            frame = None
+            data["component_errors"]["binding"] = self._failure("state", exc, "error")
+        after = self._state_observations()
+        data["interval"] = {"started_at": began, "finished_at": time.monotonic()}
+        observations = {"before": before, "after": after}
+        for field, label in (
+            ("foreground_hwnd", "foreground_changed"),
+            ("cursor", "cursor_changed"),
+        ):
+            observations[label] = (
+                before[field] != after[field]
+                if before.get(field) is not None and after.get(field) is not None
+                else None
+            )
+        success = "uia" in data or "screenshot" in data
+        output = result(
+            "partial" if success and data["component_errors"] else "ok" if success else "error",
+            "state",
+            data=data,
+            target_binding=binding,
+            delivery="read_only",
+            observations=observations,
+        )
+        if frame is not None:
+            output["frame"] = frame
+        return output
 
     def _window_details(self, windows, operation):
         from . import win32
@@ -550,11 +796,37 @@ class Runtime:
         if isinstance(data, str):
             empty = not data.strip()
         elif isinstance(data, dict):
+
+            def readable(value):
+                # Missing/redacted text is not evidence of an empty application.
+                # OCR must not bypass the provider's privacy boundary or read failure.
+                return (
+                    isinstance(value, dict)
+                    and not any(
+                        value.get(flag)
+                        for flag in (
+                            "text_redacted",
+                            "value_redacted",
+                            "text_truncated",
+                            "unavailable",
+                            "privacy_unknown",
+                            "password_unknown",
+                        )
+                    )
+                    and ("is_password" not in value or value["is_password"] is False)
+                )
+
             nodes = data.get("nodes")
             empty = (
                 isinstance(nodes, list)
                 and not data.get("truncated")
-                and not any(str(node.get("text", "")).strip() for node in nodes)
+                and readable(data)
+                and all(
+                    readable(node)
+                    and isinstance(node.get("text"), str)
+                    and not node["text"].strip()
+                    for node in nodes
+                )
             )
         else:
             empty = False
@@ -582,6 +854,8 @@ class Runtime:
             "max_nodes",
             "compact",
             "include_tokens",
+            "rich",
+            "text_limit",
             "max_output_chars",
             "max_output_bytes",
         }
@@ -591,9 +865,7 @@ class Runtime:
             "find": {"query", "match", "limit"},
             "wait_for": {"condition", "poll_interval"},
         }.get(name, set())
-        if set(request) - common - specific:
-            unknown = sorted(set(request) - common - specific)
-            raise ValueError(f"Unsupported {name} arguments: {unknown}")
+        _unsupported_fields(name, request, common | specific)
         token = request.get("token")
         selector = request.get("selector")
         if name != "list" or selector is not None or token is not None:
@@ -609,9 +881,13 @@ class Runtime:
         validate_budget(
             request.get("max_output_chars", 24000), request.get("max_output_bytes", 65536)
         )
-        for key in ("compact", "include_tokens"):
+        for key in ("compact", "include_tokens", "rich"):
             if key in request and type(request[key]) is not bool:
                 raise ValueError(f"{key} must be a boolean")
+        if "text_limit" in request and (
+            type(request["text_limit"]) is not int or not 1 <= request["text_limit"] <= 4096
+        ):
+            raise ValueError("text_limit must be an integer in [1, 4096]")
         if name == "find":
             query = request.get("query")
             if query is not None and (not isinstance(query, str) or not query):
@@ -671,7 +947,15 @@ class Runtime:
                 raise ValueError(f"selector {key} must be a string")
 
     def _validate_actions(
-        self, actions, target, native, stop_on_error, timeout, timed=False, dynamic=False
+        self,
+        actions,
+        target,
+        native,
+        stop_on_error,
+        timeout,
+        timed=False,
+        dynamic=False,
+        input_mode=None,
     ):
         self._check_open()
         if not isinstance(native, bool) or not isinstance(stop_on_error, bool):
@@ -686,12 +970,15 @@ class Runtime:
             if not isinstance(item, dict):
                 raise ValueError("Each action must be an object")
             action = dict(item)
-            name = action.get("action", action.get("type") if native else None)
+            message = input_mode == "message"
+            name = action.get("action", action.get("type") if native or message else None)
             if not isinstance(name, str):
                 raise ValueError("Each action requires an action name")
-            if "native" in action:
-                raise ValueError("Choose native once for the entire batch")
+            if {"native", "input_mode", "key_method"} & set(action):
+                raise ValueError("Choose input mode/key_method once for the entire batch")
             if dynamic and name in {"probe", "until", "shot"}:
+                if message:
+                    raise ValueError(f"Unsupported message action: {name}")
                 allowed = {"action", "condition"} if name == "until" else {"action"}
                 if set(action) != allowed:
                     raise ValueError(f"Invalid {name} marker fields")
@@ -724,20 +1011,23 @@ class Runtime:
                 if total_wait > 60:
                     raise ValueError("Total wait duration exceeds 60 seconds")
             else:
-                if not native:
+                if not native and not message:
                     action["target"] = action.get("target", target)
                     semantic = {key: value for key, value in action.items() if key != "at"}
                     self._validate_uia(semantic)
                     prepared.append(action)
                     continue
-                from .input_plan import normalize_native_action
+                if message:
+                    from .message_backend import normalize_message_action as normalize
+                else:
+                    from .input_plan import normalize_native_action as normalize
 
                 selected_target = action.get("target", target)
                 _target(selected_target)
                 if "timeout" in action:
                     _number(action["timeout"], "action timeout", 0.001, 120)
                 envelope = {key: action[key] for key in ("at", "timeout") if key in action}
-                action = normalize_native_action(
+                action = normalize(
                     {
                         key: value
                         for key, value in action.items()
@@ -758,11 +1048,14 @@ class Runtime:
         operation=None,
         key_method="scancode",
         dynamic=None,
+        input_mode=None,
+        deadline=None,
     ):
         results = []
         cleanup = None
         may_have_acted = False
         cancelled = False
+        message = input_mode == "message"
         try:
             for index, item in enumerate(actions):
                 action = dict(item)
@@ -770,22 +1063,47 @@ class Runtime:
                 began = time.monotonic()
                 dispatched = False
                 mutation = action["action"] not in {"wait", "shot"} and (
-                    native or action["action"] not in READ_ACTIONS
+                    native or message or action["action"] not in READ_ACTIONS
                 )
                 try:
                     operation.checkpoint()
                     if start is not None:
-                        operation.wait(max(0, start + at - time.monotonic()))
+                        delay = max(0, start + at - time.monotonic())
+                        if message:
+                            delay = min(delay, self._remaining(deadline, operation))
+                        operation.wait(delay)
+                    if message:
+                        self._remaining(deadline, operation)
                     if dynamic is not None and action["action"] in {"probe", "until", "shot"}:
                         dispatched = True
                         response = dynamic(action)
                     elif action["action"] == "wait":
-                        operation.wait(action.get("seconds", 0))
+                        delay = action.get("seconds", 0)
+                        if message:
+                            delay = min(delay, self._remaining(deadline, operation))
+                        operation.wait(delay)
+                        if message:
+                            self._remaining(deadline, operation)
                         response = result("ok", "wait", data={"seconds": action.get("seconds", 0)})
                     elif not native and action["action"] == "list" and action["target"] is None:
                         from . import win32
 
                         response = result("ok", "list", method="win32", data=win32.list_windows())
+                    elif message:
+                        backend = self._background()
+                        backend.set_cancel_event(operation.event)
+                        remaining = self._remaining(deadline, operation) if deadline else timeout
+                        payload = {
+                            key: value
+                            for key, value in action.items()
+                            if key not in {"target", "timeout"}
+                        }
+                        dispatched = True
+                        response = backend.execute(
+                            payload,
+                            action["target"],
+                            timeout=min(action.get("timeout", timeout), remaining),
+                        )
                     elif native:
                         self._input().set_cancel_event(operation.event)
                         dispatched = True
@@ -824,7 +1142,13 @@ class Runtime:
                     response["may_have_acted"] = mutation and dispatched
                 response.setdefault(
                     "delivery",
-                    "native" if native else "read_only" if not mutation else "accessibility",
+                    "message"
+                    if message
+                    else "native"
+                    if native
+                    else "read_only"
+                    if not mutation
+                    else "accessibility",
                 )
                 response.setdefault("fallbacks", [])
                 response["call_id"] = operation.call_id
@@ -852,13 +1176,14 @@ class Runtime:
                 if stop_on_error and response["status"] in STOP_STATUSES:
                     break
         finally:
-            if native:
+            if native or message:
+                backend = self._background() if message else self._input()
                 try:
-                    cleanup = self._input().release_all()
+                    cleanup = backend.release_all()
                 except Exception as exc:
                     cleanup = self._failure("release_all", exc, "unknown")
                 finally:
-                    self._input().set_cancel_event(None)
+                    backend.set_cancel_event(None)
         failed = [entry for entry in results if entry["result"]["status"] in STOP_STATUSES]
         if failed:
             status = "partial" if len(results) > len(failed) else failed[0]["result"]["status"]
@@ -869,7 +1194,7 @@ class Runtime:
         output = result(
             status,
             "act",
-            method="native" if native else "uia",
+            method="message" if message else "native" if native else "uia",
             data={
                 "results": results,
                 "requested": len(actions),
@@ -882,7 +1207,72 @@ class Runtime:
         if cancelled or operation.event.is_set():
             output.update(self._cancelled("act", may_have_acted))
         output["may_have_acted"] = may_have_acted
+        if message:
+            output["delivery"] = "message"
         return output
+
+    def _message_feedback(self, attempted, screenshot, operation, deadline, scope):
+        from . import win32
+
+        binding = attempted[-1]["result"].get("target_binding") if attempted else None
+        fields = ("hwnd", "pid", "process_creation_time")
+        if not isinstance(binding, dict) or any(
+            type(binding.get(key)) is not int or binding[key] <= 0 for key in fields
+        ):
+            raise ValueError("Last message action returned no complete root binding for feedback")
+        binding = {key: binding[key] for key in fields}
+        exact = f"hwnd:{binding['hwnd']}"
+        remaining = self._remaining(deadline, operation)
+        self._verify_binding(binding)
+        if screenshot == "auto":
+            return self._window_state(
+                exact, operation, timeout=remaining, deadline=deadline, scope=scope, binding=binding
+            )
+        if screenshot == "text":
+            # Read only this HWND. No OCR: privacy/absence failures cannot authorize
+            # a new caption lookup or an independent observation of another root.
+            request = dict(
+                action="text",
+                target=exact,
+                timeout=remaining,
+                compact=True,
+                depth=4,
+                max_nodes=40,
+                max_output_chars=4000,
+                max_output_bytes=12000,
+            )
+            observed = self._broker_call(self._uia(), request, remaining, operation.event)
+            self._verify_binding(binding)
+            self._remaining(deadline, operation)
+            if observed.get("status") == "ok":
+                data = observed.get("data")
+                roots = [observed.get("target_binding")]
+                if isinstance(data, dict):
+                    roots.extend(data.get(key) for key in ("root_binding", "target_binding"))
+                roots = [root for root in roots if root is not None]
+                if not roots or any(not isinstance(root, dict) for root in roots):
+                    raise win32.TargetError(
+                        "BINDING_UNAVAILABLE", "Text feedback returned no root binding"
+                    )
+                for root in roots:
+                    self._verify_binding(binding, root)
+            return bound_result(observed, 4000, 12000)
+        frame = self._camera().screenshot(
+            target=exact,
+            cancel_event=operation.event,
+            scope=scope,
+            timeout=remaining,
+            deadline=deadline,
+            max_dim=800,
+            format="jpeg",
+            quality=75,
+        )
+        self._verify_binding(binding)
+        self._remaining(deadline, operation)
+        if isinstance(frame, dict):
+            return frame
+        self._verify_binding(binding, frame.metadata)
+        return result("ok", "after", data=frame.metadata, frame=frame)
 
     def act(
         self,
@@ -902,12 +1292,13 @@ class Runtime:
         key_method="scancode",
         scope="default",
         _request_cancel=None,
+        input_mode=None,
     ):
         def execute(operation):
             try:
                 validate_budget(max_output_chars, max_output_bytes)
-                if key_method not in {"auto", "scancode", "message"}:
-                    raise ValueError("key_method must be auto, scancode, or message")
+                mode = self._input_mode(native, input_mode, key_method)
+                physical = mode == "native"
                 if type(screenshot) is not bool and (
                     not isinstance(screenshot, str) or screenshot not in {"auto", "text"}
                 ):
@@ -915,26 +1306,36 @@ class Runtime:
                 _number(settle_ms, "settle_ms", 0, 5000)
                 plan = actions
                 if focus is not None:
-                    if not native or type(focus) not in (bool, str):
+                    if not physical or type(focus) not in (bool, str):
                         raise ValueError("focus requires explicit native=true")
                     if focus is not False:
                         selected = target if focus is True else focus
                         plan = [{"action": "force_focus", "target": _target(selected)}, *actions]
-                prepared = self._validate_actions(plan, target, native, stop_on_error, timeout)
+                prepared = self._validate_actions(
+                    plan, target, physical, stop_on_error, timeout, input_mode=mode
+                )
                 prepared = self._map_actions(
                     prepared,
                     coordinate_space=coordinate_space,
                     capture_id=capture_id,
                     target=target,
                     scope=scope,
-                    native=native,
+                    native=physical or mode == "message",
                 )
             except Exception as exc:
                 return self._failure("act", exc)
             feedback_deadline = time.monotonic() + timeout
             response = self._run_actions(
-                prepared, native, stop_on_error, timeout, operation=operation, key_method=key_method
+                prepared,
+                physical,
+                stop_on_error,
+                timeout,
+                operation=operation,
+                key_method=key_method,
+                input_mode=mode,
+                deadline=feedback_deadline,
             )
+            response["delivery"] = mode if mode != "uia" else "accessibility"
             if screenshot and not operation.event.is_set() and not response.get("cancelled"):
                 try:
                     attempted = response["data"]["results"]
@@ -948,7 +1349,14 @@ class Runtime:
                     remaining = feedback_deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("After-observation deadline elapsed")
-                    if screenshot == "text" or screenshot == "auto" and not native:
+                    if mode == "message":
+                        observed = self._message_feedback(
+                            attempted, screenshot, operation, feedback_deadline, scope
+                        )
+                        if "frame" in observed:
+                            response["frame"] = observed.pop("frame")
+                        response["data"]["after"] = observed
+                    elif screenshot == "text" or screenshot == "auto" and not physical:
                         if observed_target is None:
                             observed = result(
                                 "ok", "after", method="batch_readback", data={"results": attempted}
@@ -990,7 +1398,11 @@ class Runtime:
             "act",
             {"capture_artifacts": bool(screenshot)},
             execute,
-            "native" if native else "accessibility",
+            "message"
+            if input_mode == "message"
+            else "native"
+            if native or input_mode == "native"
+            else "accessibility",
             _request_cancel,
         )
 
@@ -1102,14 +1514,15 @@ class Runtime:
         format="jpeg",
         quality=75,
         _request_cancel=None,
+        input_mode=None,
     ):
         def execute(operation):
             try:
                 validate_budget(max_output_chars, max_output_bytes)
                 if (actions is None) == (script is None):
                     raise ValueError("Provide exactly one of actions or script")
-                if key_method not in {"auto", "scancode", "message"}:
-                    raise ValueError("Invalid key_method")
+                mode = self._input_mode(native, input_mode, key_method)
+                physical = mode == "native"
                 if type(max_dim) is not int or not 0 <= max_dim <= 4096:
                     raise ValueError("max_dim must be an integer in [0, 4096]")
                 if not isinstance(format, str) or format.lower() not in {
@@ -1141,11 +1554,12 @@ class Runtime:
                 prepared = self._validate_actions(
                     plan,
                     target,
-                    native,
+                    physical,
                     stop_on_error,
                     timeout,
                     timed=script is None,
                     dynamic=script is not None,
+                    input_mode=mode,
                 )
                 prepared = self._map_actions(
                     prepared,
@@ -1153,7 +1567,7 @@ class Runtime:
                     capture_id=capture_id,
                     target=target,
                     scope=scope,
-                    native=native,
+                    native=physical or mode == "message",
                 )
                 _target(target)
                 _number(seconds, "seconds", 0.1, 30)
@@ -1313,13 +1727,15 @@ class Runtime:
                 ready.wait()
                 batch = self._run_actions(
                     prepared,
-                    native,
+                    physical,
                     stop_on_error,
                     timeout,
                     start=captured["started_at"] if script is None else None,
                     operation=operation,
                     key_method=key_method,
                     dynamic=dynamic if script is not None else None,
+                    input_mode=mode,
+                    deadline=probe_deadline,
                 )
             finally:
                 if script is not None:
@@ -1351,7 +1767,11 @@ class Runtime:
             "play",
             {"target": target},
             execute,
-            "native" if native else "accessibility",
+            "message"
+            if input_mode == "message"
+            else "native"
+            if native or input_mode == "native"
+            else "accessibility",
             _request_cancel,
         )
 
@@ -1392,6 +1812,7 @@ class Runtime:
                     "allow_shell": self.allow_shell,
                     "allow_process_control": self.allow_process_control,
                     "default_input": "strict_uia",
+                    "available_input_modes": ["uia", "native", "message"],
                     "uia_worker_started": self._broker is not None,
                     "provider_focus_side_effects_possible": True,
                     "operation": self.controller.snapshot(),
@@ -1501,7 +1922,13 @@ class Runtime:
             self._closed = True
             # Capture/worker cleanup precedes trace/store close; the runtime lock is
             # held here, so an admitted owner has already joined its child threads.
-            for resource in (self._native, self._capture, self._broker, self._services):
+            for resource in (
+                self._native,
+                self._message,
+                self._capture,
+                self._broker,
+                self._services,
+            ):
                 if resource is not None:
                     try:
                         resource.close()

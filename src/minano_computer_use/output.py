@@ -63,6 +63,43 @@ def _lists(value):
     return found
 
 
+def _guard_node_references(value):
+    """Invalidate omitted sibling-node evidence, copying only changed containers."""
+    guarded = value
+    if isinstance(value, dict):
+        nodes = value.get("nodes")
+        for key, item in value.items():
+            if key in {"target_binding", "selector_suggestion", "token", "element_token"}:
+                continue
+            if (
+                isinstance(nodes, list)
+                and key in {"focus", "selection"}
+                and isinstance(item, dict)
+                and "node_index" in item
+                and (
+                    type(item["node_index"]) is not int or not 0 <= item["node_index"] < len(nodes)
+                )
+            ):
+                replacement = {
+                    "status": "unavailable",
+                    "reason": "REFERENCED_NODE_OMITTED",
+                }
+            else:
+                replacement = _guard_node_references(item)
+            if replacement is not item:
+                if guarded is value:
+                    guarded = value.copy()
+                guarded[key] = replacement
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            replacement = _guard_node_references(item)
+            if replacement is not item:
+                if guarded is value:
+                    guarded = value.copy()
+                guarded[index] = replacement
+    return guarded
+
+
 def _failure_summaries(value):
     """Extract compact failure facts before any large list is reduced."""
     found = []
@@ -123,6 +160,7 @@ def bound_result(value: dict, max_output_chars=DEFAULT_CHARS, max_output_bytes=D
     chars, byte_limit = validate_budget(max_output_chars, max_output_bytes)
     if not isinstance(value, dict):
         raise TypeError("Result must be a JSON object")
+    value = _guard_node_references(value)
     if _fits(value, chars, byte_limit):
         return value
     saved_failures = _failure_summaries(value)
@@ -180,12 +218,14 @@ def bound_result(value: dict, max_output_chars=DEFAULT_CHARS, max_output_bytes=D
             local_failures = _failure_summaries({"results": items})
             owner[key] = local_failures[:1] or items[:1]
             owner["action_details_omitted"] = True
+            bounded = _guard_node_references(bounded)
             continue
         keep = max(1, len(items) // 2)
         owner[key] = items[:keep]
         owner["output_items_omitted"] = owner.get("output_items_omitted", 0) + len(items) - keep
         if key in {"nodes", "matches"}:
             owner["output_truncated"] = True
+        bounded = _guard_node_references(bounded)
     if _fits(bounded, chars, byte_limit):
         return bounded
     minimal = {

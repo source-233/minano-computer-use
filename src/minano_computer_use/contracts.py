@@ -2,7 +2,7 @@
 
 from typing import Any
 
-READ_ACTIONS = frozenset({"list", "tree", "text", "inspect", "find", "wait_for"})
+READ_ACTIONS = frozenset({"list", "tree", "text", "inspect", "find", "wait_for", "state"})
 UIA_ACTIONS = READ_ACTIONS | frozenset(
     {
         "invoke",

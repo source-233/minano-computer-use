@@ -1,5 +1,100 @@
 # Verification evidence and limits
 
+## 0.4 application state and background messages
+
+The three new capabilities are documented in [v0.4.md](v0.4.md): explicit
+background messages, combined application state and opt-in rich UIA metadata.
+They do not relax the foreground requirement of real native input, add another
+public tool, or enable shell/process-control permissions.
+
+Pre-release merged gate, 2026-11-12:
+| Command | Result |
+|---|---|
+| `uv run --extra wgc ruff check .` | exit0 |
+| `uv run --extra wgc ruff format --check .` | exit0; 78 files formatted |
+| `uv run --extra wgc pytest -q -o faulthandler_timeout=30` | exit0; **837 passed in 36.42s** |
+| `uv run --extra wgc python scripts/smoke_stdio.py` | exit0; seven tools, input-mode/state schemas |
+| `uv run --extra wgc python scripts/verify_windows.py` | exit0; existing own-control UIA/readback regressions |
+| `uv run --extra wgc python scripts/verify_background.py` | exit0; 18 independent own-window checks |
+| `uv run --extra wgc python scripts/verify_playback.py` | exit0; ten PyAV frames decoded, frame exports and compact montage |
+| `uv build` | exit0; 0.4.0 wheel and source distribution |
+
+The background script launches its own two NOACTIVATE windows, validates every
+root/child PID, and independently reads Edit contents and fixture counters. It
+proved exact message set_value, Unicode text, key delivery, a real standard-button
+click using a no-activation fixture subclass, drag/client-coordinate translation,
+both wheel axes/signs, unrelated same-PID root refusal, rich metadata and one root
+binding across image/UIA. Physical cursor and foreground observations were stable,
+with no real mouse/keyboard injection or focus command. Fixture exit0 and zero
+remaining owned windows are checked. Report: `.artifacts/background-smoke.json`.
+
+Actual UIA focused selected text was **unavailable** in that background fixture:
+no SetFocus was issued because it may activate the parent. Positive scoped
+selection is covered by fake-provider tests; independent native EM_GETSEL readback
+does not establish that the UIA selection path worked in this desktop scenario.
+Screenshots are screen composite and may contain occluders; no unoccluded-pixel
+claim is made. Combined state is bound but non-atomic, with per-component timing
+and partial-error reporting rather than a same-frame claim.
+
+The generic cursor observation now uses GetPhysicalCursorPos, avoiding false
+motion caused by a DPI-context change after UIA/MSS import. Password/unknown
+password structured values and text are redacted; a redacted response is not an
+empty response and cannot trigger OCR fallback. Screenshots themselves may still
+contain anything the application paints; text redaction is not image masking.
+
+Message tests include an actual isolated synthetic worker for cancellation,
+timeout, kill/reap and uncertainty classification. Messages possibly queued before
+a worker loss are not replayed; a new worker cannot confirm releases for old
+possibly held messages. This is not a guarantee of background compatibility with
+every application or game. Final source-boundary review is recorded after gate.
+
+The first source review found five cases not covered by that pre-repair run:
+explicit message image/text feedback could rediscover a reused caption; posted
+text could be processed after a subsequent synchronous value replacement;
+reparented controls could outlive traversal-based focus/selection proof;
+aggregate ancestor values could bypass descendant password redaction; and output
+pruning could leave focus/selection indices referring to omitted nodes. The
+837-test result above is therefore a checkpoint, not a final post-repair claim.
+
+Repairs bind every message feedback variant to the action's original root, use
+bounded synchronous payload dispatch consistently, revalidate live UIA ancestry,
+apply unsafe descendant scope to value reads, and invalidate omitted-node
+references without remapping them. The owned-window script also checks mixed
+text/value ordering. A later attempted desktop run was stopped by observed cursor
+interference and is not counted as fresh passing evidence; guards and no-replay
+behavior were retained. Final validation follows after all writers are frozen.
+
+Post-repair frozen-source validation:
+| Command | Result |
+|---|---|
+| `uv run --extra wgc ruff check .` | exit0 |
+| `uv run --extra wgc ruff format --check .` | exit0; 78 files formatted |
+| `uv run --extra wgc pytest -q -o faulthandler_timeout=30` | exit0; **899 passed in 34.35s** |
+| `uv run --extra wgc python scripts/smoke_stdio.py` | exit0; seven tools and 0.4 schema |
+| `uv run --extra wgc python scripts/verify_background.py` | exit0; **19 checks**, including mixed text/value ordering |
+| `uv run --extra wgc python scripts/verify_playback.py` | exit0; ten decoded PyAV frames, three original PNG exports, JPEG800x343 |
+| `uv build` | exit0; 0.4.0 wheel and source distribution |
+
+The first post-repair suite exposed one stale integration-test adapter still
+implementing `post_message`; it was changed to the production `dispatch_message`
+interface before the passing run. No production fallback was added. The new live
+ordering check sends `set_value("") -> text("A") -> set_value("B")` in one batch
+and immediately reads exact `B` through an independent bounded WM_GETTEXT call;
+it uses no sleep or pretend queue barrier. Physical cursor and foreground were
+stable for the successful run, and all owned fixture windows were reclaimed.
+The unavailable UIA selected-text boundary above is unchanged.
+
+The same reviewer returned **PASS** on the five-finding narrow re-review, with
+40 independent in-memory regression cases. The 0.4.0 wheel was installed into
+the global uv tool environment; installed source hashes matched this source,
+and the installed interpreter passed the stdio smoke and all 19 owned-window
+checks. Global OpenCode configuration was restored byte-for-byte, without
+enabling shell or process-control permissions. The live MCP advertises the
+three input modes and retains strict UIA as the default.
+
+After completion, the user separately authorized a new 0.4 commit and normal
+push to main. Machine configuration and generated artifacts remain excluded.
+
 ## Current video backend — 0.3.1
 
 PyAV 19.0.2 is a locked mandatory dependency. The production MP4 path no longer

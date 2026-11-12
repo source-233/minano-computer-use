@@ -43,6 +43,8 @@ def _user32():
     user32.ShowWindow.restype = wintypes.BOOL
     user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
     user32.GetCursorPos.restype = wintypes.BOOL
+    user32.GetPhysicalCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetPhysicalCursorPos.restype = wintypes.BOOL
     return user32
 
 
@@ -125,12 +127,15 @@ def resolve_window(target: str) -> dict:
 def observations() -> dict:
     user32 = _user32()
     point = wintypes.POINT()
-    cursor = [point.x, point.y] if user32.GetCursorPos(ctypes.byref(point)) else None
+    # Read physical coordinates directly. Loading MSS/UIA can change a caller's
+    # DPI context; GetCursorPos would otherwise manufacture apparent motion.
+    cursor = [point.x, point.y] if user32.GetPhysicalCursorPos(ctypes.byref(point)) else None
     foreground = user32.GetForegroundWindow()
     return {
         "foreground_hwnd": int(foreground or 0),
         "cursor": cursor,
         "cursor_available": cursor is not None,
+        "cursor_coordinate_space": "physical_screen",
     }
 
 

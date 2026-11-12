@@ -135,3 +135,25 @@ def test_window_identity_exposes_unavailable_process_time_honestly(monkeypatch):
     )
     monkeypatch.setattr(win32, "process_creation_time", lambda pid: None)
     assert win32.window_identity(10, 20) == {"hwnd": 10, "pid": 20, "process_creation_time": None}
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_observations_use_physical_cursor_without_dpi_dependent_fallback(monkeypatch, available):
+    def physical(point):
+        point._obj.x, point._obj.y = -120, 900
+        return available
+
+    monkeypatch.setattr(
+        win32,
+        "_user32",
+        lambda: NS(
+            GetPhysicalCursorPos=physical,
+            GetCursorPos=lambda point: pytest.fail("DPI-dependent cursor must not be used"),
+            GetForegroundWindow=lambda: 42,
+        ),
+    )
+    observed = win32.observations()
+    assert observed["cursor"] == ([-120, 900] if available else None)
+    assert observed["cursor_available"] is available
+    assert observed["cursor_coordinate_space"] == "physical_screen"
+    assert observed["foreground_hwnd"] == 42

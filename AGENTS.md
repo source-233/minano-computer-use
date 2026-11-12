@@ -24,6 +24,7 @@
 - 不允许输出截断改变 selector 唯一性；不允许 token 失效后自动按名称重搜并执行写动作。
 - WGC 为可选 extra；本机 CreateForWindow 转换失败，不得用 fallback 或 mock 宣称已验证 WGC。
 - MP4 后端使用 PyAV，编码必须在可终止并回收的独立 Python 工作进程执行，不依赖外部 ffmpeg.exe；合成验证与实际应用录像是不同证据。
+- 0.4 后台消息通道独立于 native：`input_mode=message` 单次明确选择，不允许物理输入/聚焦回退；组合应用状态不是原子截图，遵守 `docs/v0.4.md` 的身份、部分失败和敏感值边界。
 - 不自动提交：上次第一版提交授权不等于后续每次修改可直接提交。
 - 使用 `uv sync --python 3.13`；验证 `uv run ruff check .`、`uv run pytest -q`。
 - 真实桌面输入不在默认测试中运行；Windows UIA 集成测试只操作自有 fixture。

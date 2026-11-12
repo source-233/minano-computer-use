@@ -1,3 +1,4 @@
+import copy
 import json
 
 import pytest
@@ -142,6 +143,107 @@ def test_large_window_listing_retains_a_bounded_prefix():
     assert 0 < len(bounded["data"]) < 300
     assert bounded["output_truncated"]
     assert len(wire(bounded)) <= 24000
+
+
+def state_result(node_index=24):
+    return {
+        "status": "ok",
+        "operation": "state",
+        "method": "uia",
+        "data": {
+            "nodes": [
+                {"name": "n" * 500, "parent_index": index - 1 if index else None}
+                for index in range(25)
+            ],
+            "focus": {"status": "available", "node_index": node_index},
+            "selection": {
+                "status": "available",
+                "node_index": node_index,
+                "ranges": ["selection plaintext"],
+                "element": {"name": "selected element"},
+                "path": "selected path",
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("chars,byte_limit", [(24000, 65536), (65536, 24000), (2048, 2048)])
+def test_state_budget_invalidates_omitted_node_references(chars, byte_limit):
+    value = state_result()
+    original = copy.deepcopy(value)
+    bounded = bound_result(value, chars, byte_limit)
+    assert bounded["status"] == "ok"
+    assert bounded["method"] == "uia"
+    assert bounded["output_truncated"]
+    assert 0 < len(bounded["data"]["nodes"]) < 25
+    for field in ("focus", "selection"):
+        assert bounded["data"][field] == {
+            "status": "unavailable",
+            "reason": "REFERENCED_NODE_OMITTED",
+        }
+    assert "selection plaintext" not in wire(bounded)
+    assert len(wire(bounded)) + 32 <= chars
+    assert len(wire(bounded).encode("utf-8")) + 32 <= byte_limit
+    assert value == original
+
+
+def test_state_budget_preserves_retained_node_references():
+    value = state_result(0)
+    bounded = bound_result(value)
+    assert len(bounded["data"]["nodes"]) < 25
+    for field in ("focus", "selection"):
+        assert bounded["data"][field] == value["data"][field]
+    assert bound_result(bounded) is bounded
+
+
+@pytest.mark.parametrize("wrapper", ["uia", "after"])
+def test_nested_state_references_rechecked_by_final_budget(wrapper):
+    worker = bound_result(state_result(), 65536, 65536)
+    assert worker["data"]["selection"]["status"] == "available"
+    value = {"status": "partial", "method": "compose", "may_have_acted": True, "data": {}}
+    value["data"][wrapper] = worker["data"] if wrapper == "uia" else worker
+    original = copy.deepcopy(value)
+    bounded = bound_result(value)
+    state = bounded["data"][wrapper]
+    if wrapper == "after":
+        state = state["data"]
+    assert len(state["nodes"]) < 25
+    assert state["focus"]["status"] == state["selection"]["status"] == "unavailable"
+    assert "ranges" not in state["selection"]
+    assert bounded["status"] == "partial"
+    assert bounded["method"] == "compose"
+    assert bounded["may_have_acted"] is True
+    assert len(wire(bounded)) + 32 <= 24000
+    assert value == original
+
+
+@pytest.mark.parametrize("node_index", [-1, 1, True, False, "0", None])
+def test_invalid_state_reference_sanitized_without_mutating_input(node_index):
+    value = state_result(node_index)
+    value["data"]["nodes"] = [{"name": "retained"}]
+    original = copy.deepcopy(value)
+    bounded = bound_result(value)
+    assert bounded is not value
+    for field in ("focus", "selection"):
+        assert bounded["data"][field] == {
+            "status": "unavailable",
+            "reason": "REFERENCED_NODE_OMITTED",
+        }
+    assert value == original
+
+
+def test_unindexed_and_unrelated_statuses_unchanged():
+    value = {
+        "status": "ok",
+        "data": {
+            "nodes": [],
+            "focus": {"status": "unavailable", "reason": "No scoped focus"},
+            "selection": {"status": "redacted", "reason": "Password"},
+            "actions": [{"status": "ok", "node_index": 24}],
+            "target_binding": {"nodes": [], "focus": {"node_index": 24}},
+        },
+    }
+    assert bound_result(value) is value
 
 
 @pytest.mark.parametrize("value", [1, 2047, 1048577, True, 5000.5])

@@ -38,11 +38,23 @@ async def main() -> None:
                     "system",
                     "window",
                 ], names
+                schemas = {tool.name: tool.inputSchema["properties"] for tool in tools.tools}
+                for name in ("act", "play"):
+                    assert "input_mode" in schemas[name]
+                assert {"rich", "text_limit", "include_ax", "include_screenshot"} <= set(
+                    schemas["window"]
+                )
+                assert all("ctx" not in schema for schema in schemas.values())
                 status = await client.call_tool("system", {"action": "status"})
                 assert not status.isError, status
                 assert status.structuredContent is not None
                 assert status.structuredContent["data"]["input_policy"] == "explicit_per_call"
                 assert status.structuredContent["data"]["default_input"] == "strict_uia"
+                assert status.structuredContent["data"]["available_input_modes"] == [
+                    "uia",
+                    "native",
+                    "message",
+                ]
                 assert status.structuredContent["data"]["uia_worker_started"] is False
                 windows = await client.call_tool("window", {"action": "list"})
                 assert not windows.isError, windows

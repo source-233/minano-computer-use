@@ -150,6 +150,14 @@ def create_server(
         native: bool = False,
         allow_process_control: bool = False,
         details: bool = False,
+        rich: bool | None = None,
+        text_limit: int | None = None,
+        include_ax: bool = True,
+        include_screenshot: bool = True,
+        max_dim: int = 800,
+        format: str = "jpeg",
+        quality: int = 75,
+        ctx: Context = None,
     ) -> CallToolResult:
         """List/read windows or use semantic UIA patterns; never physically falls back."""
         kwargs = dict(
@@ -167,6 +175,18 @@ def create_server(
         for key, item in (("window", window), ("role", role), ("nth", nth)):
             if item is not None:
                 kwargs[key] = item
+        if action in {"state", "tree", "text", "find", "inspect", "get_text", "ui_tree"}:
+            kwargs["rich"] = action == "state" if rich is None else rich
+            if text_limit is not None or action == "state":
+                kwargs["text_limit"] = 500 if text_limit is None else text_limit
+        if action == "state":
+            kwargs.update(
+                include_ax=include_ax,
+                include_screenshot=include_screenshot,
+                max_dim=max_dim,
+                format=format,
+                quality=quality,
+            )
         if action == "list":
             # Preserve the original default list API (no default 20-item truncation).
             if query is not None or details or limit is not None:
@@ -191,7 +211,7 @@ def create_server(
                 kwargs[key] = item
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
         return _response(
-            await invoke(owned.window, action, target, selector, **kwargs),
+            await invoke(owned.window, action, target, selector, scope=caller_scope(ctx), **kwargs),
             "window",
             max_output_chars,
             max_output_bytes,
@@ -212,14 +232,18 @@ def create_server(
         settle_ms: float = 80,
         focus: bool | str | None = None,
         key_method: str = "scancode",
+        input_mode: str | None = None,
         ctx: Context = None,
     ) -> CallToolResult:
-        """Run up to 100 ordered actions. Native requires explicit native=true per call.
+        """Run ordered actions with uia, native, or background message input_mode.
+
+        Omitted input_mode preserves native=false/true. Explicit native or message
+        mode opts in alone; native=true conflicts with explicit uia/message.
 
         Explicit native force_focus restores/attaches input threads and verifies the exact
         foreground HWND; focus keeps conservative SetForegroundWindow behavior. Neither
         is automatically used before keyboard or mouse actions.
-        Auto feedback returns an image for native calls, compact text for strict UIA;
+        Auto feedback returns full state for message, an image for native, text for UIA;
         screenshot=false disables feedback. Observation does not verify game effects.
         """
         return _response(
@@ -238,6 +262,7 @@ def create_server(
                 settle_ms=settle_ms,
                 focus=focus,
                 key_method=key_method,
+                input_mode=input_mode,
                 scope=caller_scope(ctx),
             ),
             "act",
@@ -352,6 +377,7 @@ def create_server(
         max_dim: int = 800,
         format: str = "jpeg",
         quality: int = 75,
+        input_mode: str | None = None,
         ctx: Context = None,
     ) -> CallToolResult:
         """Timed actions (at seconds) alongside capture; no strict frame/action pairing."""
@@ -373,6 +399,7 @@ def create_server(
                 coordinate_space=coordinate_space,
                 capture_id=capture_id,
                 key_method=key_method,
+                input_mode=input_mode,
                 allow_shell=allow_shell,
                 max_dim=max_dim,
                 format=format,

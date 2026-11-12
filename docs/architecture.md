@@ -1,5 +1,10 @@
 # Architecture / implementation contract
 
+0.4 adds a separate background-message executor and bound, non-atomic application
+state. See [v0.4.md](v0.4.md) for input selection, worker identity/cleanup, rich
+UIA discovery, redaction and per-component failure semantics. Native foreground
+checks remain unchanged; background mode is not a bypass inside NativeInput.
+
 Current video backend (0.3.1): PyAV is a mandatory Python dependency. Production
 H.264/MP4 encoding runs in an isolated, terminable Python worker with bounded
 anonymous-file I/O. No external ffmpeg/ffprobe executable is required. Parent
