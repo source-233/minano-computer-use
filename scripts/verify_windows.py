@@ -1,0 +1,177 @@
+"""Opt-in real UIA smoke against our own fixture, not Calculator or a game."""
+
+import ctypes
+import json
+import subprocess
+import sys
+import time
+from ctypes import wintypes as w
+from pathlib import Path
+
+
+def main() -> None:
+    if sys.platform != "win32":
+        raise SystemExit("Windows required")
+    from minano_computer_use.runtime import Runtime
+
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.SendMessageTimeoutW.argtypes = [
+        w.HWND,
+        w.UINT,
+        w.WPARAM,
+        w.LPARAM,
+        w.UINT,
+        w.UINT,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    user.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+    user.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+    user.SendMessageW.restype = ctypes.c_ssize_t
+    user.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+    user.PostMessageW.restype = w.BOOL
+    fixture = Path(__file__).resolve().parents[1] / "tests/windows_fixture.py"
+    child = subprocess.Popen(
+        [sys.executable, str(fixture)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    runtime = None
+    hwnd = 0
+    report: dict = {"native_input_used": False, "checks": {}}
+
+    def text(handle: int) -> str:
+        buffer = ctypes.create_unicode_buffer(1024)
+        copied = ctypes.c_size_t()
+        if not user.SendMessageTimeoutW(
+            handle,
+            0x000D,
+            len(buffer),
+            ctypes.addressof(buffer),
+            0x0002,
+            2000,
+            ctypes.byref(copied),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.value
+
+    try:
+        assert child.stdout is not None
+        info = json.loads(child.stdout.readline())
+        hwnd = info["hwnd"]
+        report["fixture"] = info
+        runtime = Runtime(allow_native=False)
+        target = f"hwnd:{hwnd:#x}"
+        tree = runtime.window("tree", target=target, depth=4, max_nodes=100, timeout=10)
+        report["tree"] = tree
+        assert tree["status"] in {"ok", "verified"}, tree
+        value = "Minano verified 你好"
+        changed = runtime.window(
+            "set_value",
+            target=target,
+            selector={"automation_id": "1001"},
+            value=value,
+            timeout=5,
+        )
+        report["set_value"] = changed
+        assert changed["status"] == "verified", changed
+        assert text(info["edit"]) == value
+        report["checks"]["set_value_native_readback"] = True
+        invoked = runtime.window("invoke", target=target, selector="Apply", timeout=5)
+        report["invoke"] = invoked
+        assert invoked["status"] == "invoked", invoked
+        deadline = time.monotonic() + 2
+        while text(info["status"]) != "Invocations:1" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert text(info["status"]) == "Invocations:1"
+        report["checks"]["invoke_native_counter"] = True
+        toggled = runtime.window("toggle", target=target, selector="Enabled", timeout=5)
+        report["toggle"] = toggled
+        assert toggled["status"] == "verified", toggled
+        assert user.SendMessageW(info["checkbox"], 0x00F0, 0, 0) == 1
+        report["checks"]["toggle_native_readback"] = True
+        ambiguous = runtime.window("invoke", target=target, selector="Duplicate", timeout=5)
+        report["ambiguous"] = ambiguous
+        assert ambiguous["status"] == "refused", ambiguous
+        unsupported = runtime.window(
+            "invoke",
+            target=target,
+            selector={"automation_id": "1001"},
+            timeout=5,
+        )
+        report["unsupported"] = unsupported
+        assert unsupported["status"] == "refused", unsupported
+        report["checks"]["ambiguous_and_unsupported_refused"] = True
+        assert text(info["status"]) == "Invocations:1"
+        report["checks"]["no_unrequested_second_invoke"] = True
+        found = runtime.window(
+            "find",
+            target=target,
+            query="Apply",
+            match="contains",
+            include_tokens=True,
+            timeout=5,
+        )
+        report["find"] = found
+        assert found["status"] == "ok", found
+        inspected = runtime.window(
+            "inspect",
+            target=target,
+            selector={"automation_id": "1001"},
+            include_tokens=True,
+            timeout=5,
+        )
+        report["token_issued"] = inspected
+        token = inspected["data"]["token"]
+        token_use = runtime.window("inspect", target=target, token=token, timeout=5)
+        report["token_use"] = token_use
+        assert token_use["status"] == "ok", token_use
+        rejected = runtime.window("inspect", target=target, token="invalid-token", timeout=5)
+        assert rejected["status"] == "refused", rejected
+        report["checks"]["token_and_invalid_token"] = True
+        delayed = runtime.window("invoke", target=target, selector="Delayed apply", timeout=5)
+        assert delayed["status"] == "invoked", delayed
+        waited = runtime.window(
+            "wait_for",
+            target=target,
+            selector="Delayed ready",
+            condition={"exists": True},
+            poll_interval=0.02,
+            timeout=2,
+        )
+        report["wait_for"] = waited
+        assert waited["status"] == "verified", waited
+        report["checks"]["delayed_wait_for"] = True
+        budgeted = runtime.window(
+            "tree",
+            target=target,
+            max_output_chars=2048,
+            max_output_bytes=4096,
+            timeout=5,
+        )
+        report["bounded_tree"] = budgeted
+        assert budgeted["status"] == "ok", budgeted
+        assert len(json.dumps(budgeted, ensure_ascii=False).encode()) <= 4096
+        report["checks"]["budgeted_tree"] = True
+        report["passed"] = True
+    finally:
+        if runtime is not None:
+            runtime.close()
+        if hwnd:
+            user.PostMessageW(hwnd, 0x0010, 0, 0)
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=3)
+        if child.stderr is not None:
+            report["fixture_stderr"] = child.stderr.read()
+        report["fixture_exit_code"] = child.returncode
+        output = Path(__file__).resolve().parents[1] / ".artifacts/windows-smoke.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps({"report": str(output), **report["checks"]}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
