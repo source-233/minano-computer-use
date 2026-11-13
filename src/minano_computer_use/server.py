@@ -166,6 +166,9 @@ def create_server(
 
         state accepts capture_mode/allow_fallback for its independent image component;
         defaults remain screen/false. No focus activation; components are non-atomic.
+        include_tokens=True adds bounded, expiring node tokens usable by later UIA actions.
+        UIA set_value writes once, then checks that same live element for at most 600ms
+        within the remaining call deadline; it never searches again or repeats the write.
         """
         kwargs = dict(
             depth=depth,

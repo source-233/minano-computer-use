@@ -1,6 +1,53 @@
 # Verification evidence and limits
 
-## 0.5 feedback and wire fidelity — verified source, not globally installed
+## 0.5.1 UIA token and write confirmation
+
+This release adds bounded actionable tokens to `state(include_tokens=true)` and
+single-write `set_value` confirmation against the same pinned UIA reference. Tokens
+are issued only when returned metadata and the cached live binding agree; failed
+state publication rolls back token-cache and binding changes. SetValue polls at
+50ms intervals for at most 600ms inside the call deadline. No selector re-search
+or write replay occurs. If the deadline expires before a final privacy check, the
+unknown result omits both before/after values rather than performing more UIA reads.
+
+| Command | Result |
+|---|---|
+| `uv run --no-sync ruff check .` | exit 0 |
+| `uv run --no-sync ruff format --check .` | exit 0; 95 files formatted |
+| `uv run --no-sync pytest -q -o faulthandler_timeout=30` | exit 0; **1237 passed in 30.61s** |
+| `uv run --no-sync python scripts/smoke_stdio.py` | exit 0; seven tools and running version 0.5.1 |
+| `uv run --no-sync python scripts/verify_feedback.py` | exit 0; six transport/data-fidelity checks |
+| `uv run --no-sync python scripts/verify_windows.py` | exit 0; 13 owned-window checks, fixture exit 0 |
+| `uv lock --check --offline` | exit 0 |
+| `uv build` | exit 0; 0.5.1 wheel and source distribution |
+
+The owned-window check obtains Edit and Apply tokens from one screenshot-free state,
+uses them directly for SetValue and Invoke, and verifies the resulting native text
+and invocation count. Delayed readback, single-write counts, deadline crossings,
+metadata changes, token expiration and rollback are established with deterministic
+fakes; this does not claim every real UIA provider has bounded response latency.
+Reports: `.artifacts/windows-smoke.json`, `.artifacts/stdio-smoke.json`, and
+`.artifacts/feedback-smoke.json`. No user application, physical input, IME switch,
+game recording or new WGC/background-input experiment was part of this gate.
+
+The independent review closed the published-metadata/token mismatch, the
+post-write deadline overrun, and the remaining pre-write discovery gap. The last
+reproduction confirms that slow resolution crossing the deadline starts no
+subsequent handle/COM/walk calls and performs no write; deadline expiry during
+token validation does not delete a valid cached token.
+
+The verified non-editable wheel was deployed to the global MCP. Using the tool's
+installed Python with `PYTHONPATH`/`PYTHONHOME` unset and user-site imports disabled,
+all 26 installed Python modules matched the verified source hashes. The installed
+interpreter then ran `scripts/smoke_stdio.py`, `scripts/verify_feedback.py`, and
+`scripts/verify_windows.py`: each exited 0, with all 13 owned-window checks passing
+and fixture exit 0. Reports are retained in `.artifacts/installed-0.5.1/`.
+The reconnected global `system.status` reports `package_version="0.5.1"`, strict
+UIA by default, and shell/process-control gates disabled. Its configuration was
+restored byte-for-byte. The source release is versioned separately from the global
+wheel installation.
+
+## 0.5.0 feedback and wire fidelity — historical pre-deployment evidence
 
 ### Final additional-review gate — 1112 tests, 2026-11-13
 

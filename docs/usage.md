@@ -124,6 +124,7 @@ recipient 是目标根窗口或同进程子控件 HWND。消息通道明确绑�
   "include_screenshot":true,
   "capture_mode":"window",
   "allow_fallback":false,
+  "include_tokens":true,
   "rich":true,
   "text_limit":500,
   "depth":8,
@@ -133,6 +134,12 @@ recipient 是目标根窗口或同进程子控件 HWND。消息通道明确绑�
   "quality":75
 }
 ```
+
+设置 `include_tokens=true` 时，已观察到且可安全绑定的控件节点会带有短期
+`token` 和 `token_ttl_seconds`，可以直接传给后续的 `act` 或 `window` 控件动作；
+不需要再 `find` 一次。token 绑定具体窗口、进程和 UIA 元素，默认 TTL 为 60 秒，
+最多缓存 256 个；树被截断时只会给已观察到的节点发 token，不代表未返回节点不存在。
+过期、重启 worker、窗口或元素身份变化会拒绝 token，必须重新观察，不能按名称自动重搜。
 
 返回的 data.uia 包含控件、目标内焦点与选区；data.screenshot 是图像元数据，
 图片仍是独立 MCP image 内容。state 不主动切到前台。两个组件绑定相同根窗口
@@ -184,6 +191,13 @@ tree/text/find/inspect 可指定 rich=true，查看类名、原生 HWND、启用
   "value":"你好 Minano"
 }
 ```
+
+`set_value` 只提交一次写入，然后在同一已绑定 UIA 元素上做短时只读确认，最长约
+600ms、约每 50ms 轮询一次，并受调用剩余期限约束。身份或元素引用变旧会立即停止；
+超时/读回不匹配返回不确定，不会重新查找或重写。重试前先重新观察当前值。
+确认期限耗尽后不再发起新的 UIA 查询；无法完成最终隐私校验时，`before` 和
+`after` 均省略为 null，并标记 `value_redacted=true`。已在执行中的 COM 调用仍由
+worker 的硬超时与取消回收机制约束，600ms 不是对任意 provider 响应时间的保证。
 
 字符串 selector 是区分大小写的精确 Name；对象条件 AND 组合。可明确传零起点
 `index` 选重复项；搜索被截断时仍拒绝。普通按钮仅返回 `invoked`，不虚报完成。

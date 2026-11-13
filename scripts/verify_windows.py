@@ -189,6 +189,63 @@ def main() -> None:
         assert fields["ime_open"]["status"] == "unknown", context
         assert fields["ime_conversion"]["status"] == "unknown", context
         report["checks"]["read_only_input_context_unknowns_preserved"] = True
+        # 从同一次只读 state 获取能力令牌；写操作不再按名称/selector 重搜。
+        token_state = runtime.window(
+            "state",
+            target=target,
+            include_ax=True,
+            include_screenshot=False,
+            include_tokens=True,
+            depth=4,
+            max_nodes=100,
+            timeout=10,
+        )
+        report["window_state_tokens"] = token_state
+        assert token_state["status"] == "ok", token_state
+        assert "frame" not in token_state, token_state
+        token_data = token_state["data"]
+        binding = token_state["target_binding"]
+        assert binding["hwnd"] == hwnd and binding["pid"] == info["pid"], binding
+        assert binding["process_creation_time"] is not None, binding
+        assert token_data["target_binding"] == binding, token_data
+        assert token_data["uia"]["root_binding"] == binding, token_data
+        assert not token_data["component_errors"], token_data
+        assert "screenshot" not in token_data, token_data
+        assert token_data["uia"]["truncated"] is False, token_data
+        nodes = token_data["uia"]["nodes"]
+        edit_nodes = [node for node in nodes if node.get("automation_id") == "1001"]
+        apply_nodes = [node for node in nodes if node.get("automation_id") == "1002"]
+        assert len(edit_nodes) == len(apply_nodes) == 1, nodes
+        edit_node, apply_node = edit_nodes[0], apply_nodes[0]
+        assert apply_node["name"] == "Apply", apply_node
+        for node in (edit_node, apply_node):
+            assert isinstance(node.get("token"), str) and node["token"], node
+            assert 0 < node["token_ttl_seconds"] <= 60, node
+        assert edit_node["token"] != apply_node["token"], nodes
+        report["checks"]["state_tokens_exact_root_binding"] = True
+        token_value = "Minano state token verified 你好"
+        token_changed = runtime.window(
+            "set_value",
+            target=target,
+            token=edit_node["token"],
+            value=token_value,
+            timeout=5,
+        )
+        report["state_token_set_value"] = token_changed
+        assert token_changed["status"] == "verified", token_changed
+        assert text(info["edit"]) == token_value
+        assert text(info["status"]) == "Invocations:1"
+        report["checks"]["state_token_set_value_native_readback"] = True
+        token_invoked = runtime.window(
+            "invoke", target=target, token=apply_node["token"], timeout=5
+        )
+        report["state_token_invoke"] = token_invoked
+        assert token_invoked["status"] == "invoked", token_invoked
+        deadline = time.monotonic() + 2
+        while text(info["status"]) != "Invocations:2" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert text(info["status"]) == "Invocations:2"
+        report["checks"]["state_token_invoke_native_counter"] = True
         report["passed"] = True
     finally:
         if runtime is not None:

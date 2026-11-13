@@ -147,7 +147,10 @@ def test_set_value_mismatch_is_not_success():
     control = Control("edit", patterns={2: Value()})
     response = run(Control("root", children=[control]), "set_value", selector="edit", value="new")
     assert response["status"] == "unknown"
-    assert response["data"]["after"] == "provider ignored"
+    assert response["error"]["code"] == "READBACK_TIMEOUT"
+    assert response["may_have_acted"] is True
+    assert response["data"]["before"] is response["data"]["after"] is None
+    assert response["data"]["value_redacted"] is True
 
 
 def test_invoke_is_invoked_not_verified_and_reports_focus_change():

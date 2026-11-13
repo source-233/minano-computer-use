@@ -246,7 +246,7 @@ def test_async_value_write_is_not_replayed_by_explicit_wait():
     write = service.execute(
         {"action": "set_value", "target": "App", "selector": "edit", "value": "new"}
     )
-    assert write["status"] == "unknown" and write["may_have_acted"] is True
+    assert write["status"] == "verified"
     observed = service.execute(
         {
             "action": "wait_for",

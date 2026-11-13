@@ -59,6 +59,8 @@ FAILURE_PREDICATES = frozenset(
         "candidate_hwnd_membership_mismatch",
         "native_membership_unavailable",
         "provider_property_unavailable",
+        "token_binding_changed",
+        "token_metadata_changed",
     }
 )
 FAILURE_STAGES = frozenset(
@@ -79,6 +81,13 @@ FAILURE_STAGES = frozenset(
         "metadata_before_read",
         "before_publication",
         "root_before_publication",
+        "token_before_issue",
+        "token_after_issue",
+        "token_before_publication",
+        "token_after_metadata",
+        "token_binding_before_publication",
+        "set_value_initial_control",
+        "set_value_verification",
     }
 )
 FAILURE_ERROR_TYPES = frozenset(

@@ -25,6 +25,10 @@ class Refusal(Exception):
         self.details = details
 
 
+class _VerificationExpired(Exception):
+    """Internal checkpoint, never provider text or a retry signal."""
+
+
 def _error_type(error):
     # Provider-defined exception names can also contain private data. Expose only
     # fixed, useful categories, never exception text or arbitrary class names.
@@ -85,6 +89,7 @@ class UIABackend:
 
     def execute(self, request: dict) -> dict:
         self._check_owner()
+        self._execute_started = self._clock()
         action = request.get("action", "inspect")
         before = None
         self._may_have_acted = False
@@ -141,34 +146,46 @@ class UIABackend:
             output["target_binding"] = self._target_binding
         return bound_result(output, max_output_chars=budgets[0], max_output_bytes=budgets[1])
 
-    def _pattern(self, control, name):
+    def _pattern(self, control, name, *, checkpoint=None):
         # GetPattern swallows COMError in uiautomation. Distinguish unsupported from
         # a provider that advertises support but fails to supply the promised pattern.
         property_ids = getattr(self.auto, "PropertyId", None)
         available_id = getattr(property_ids, "Is" + name + "PatternAvailableProperty", None)
         advertised = None
         if available_id is not None:
+            if checkpoint is not None:
+                checkpoint()
             advertised = control.GetPropertyValue(available_id)
             if type(advertised) is not bool:
                 raise RuntimeError("Provider pattern availability is unavailable")
             if not advertised:
                 return None
+        if checkpoint is not None:
+            checkpoint()
         pattern = control.GetPattern(getattr(self.auto.PatternId, name + "Pattern"))
         if pattern is None and advertised:
             raise RuntimeError(f"Provider advertised {name}Pattern but retrieval failed")
         return pattern
 
     @staticmethod
-    def _metadata(control):
-        strings = {
-            "name": str(control.Name),
-            "automation_id": str(control.AutomationId),
-            "control_type": str(control.ControlTypeName),
-        }
+    def _metadata(control, *, checkpoint=None):
+        strings = {}
+        for key, prop in (
+            ("name", "Name"),
+            ("automation_id", "AutomationId"),
+            ("control_type", "ControlTypeName"),
+        ):
+            if checkpoint is not None:
+                checkpoint()
+            strings[key] = str(getattr(control, prop))
+        if checkpoint is not None:
+            checkpoint()
         data = {
             **{key: value if len(value) <= 4096 else None for key, value in strings.items()},
             "pid": int(control.ProcessId),
         }
+        if checkpoint is not None:
+            checkpoint()
         if any(len(value) > 4096 for value in strings.values()):
             data["metadata_truncated"] = True
             data["fields_omitted"] = [key for key, value in strings.items() if len(value) > 4096]
@@ -310,13 +327,15 @@ class UIABackend:
         except Exception as exc:
             entry.setdefault("unavailable", {})["text"] = self._unavailable(exc)
 
-    def _unsafe_text_nodes(self, nodes, truncated):
+    def _unsafe_text_nodes(self, nodes, truncated, *, checkpoint=None):
         # A TextPattern on an ancestor can include descendant password text. If the
         # traversal cannot establish the entire scope, redact rather than infer.
         if truncated:
             return set(range(len(nodes)))
         unsafe = set()
         for index, (node, _, _) in enumerate(nodes):
+            if checkpoint is not None:
+                checkpoint()
             if self._password(node) is False:
                 continue
             while index is not None:
@@ -324,9 +343,11 @@ class UIABackend:
                 index = nodes[index][2]
         return unsafe
 
-    def _aggregate_value_safe(self, control, depth, maximum):
-        nodes, truncated = self._walk(control, depth, maximum)
-        return not truncated and not self._unsafe_text_nodes(nodes, truncated)
+    def _aggregate_value_safe(self, control, depth, maximum, *, checkpoint=None):
+        nodes, truncated = self._walk(control, depth, maximum, checkpoint=checkpoint)
+        return not truncated and not self._unsafe_text_nodes(
+            nodes, truncated, checkpoint=checkpoint
+        )
 
     @staticmethod
     def _membership_failure(predicate, error=None):
@@ -370,14 +391,18 @@ class UIABackend:
                 )
         return dict(expected)
 
-    def _state_live_candidate(self, control, original_id, root, root_id, expected):
+    def _state_live_candidate(
+        self, control, original_id, root, root_id, expected, *, checkpoint=None
+    ):
         """Return only the first original check's failure; None means established.
 
         Keep provider reads/short circuiting in their original order. In particular,
         the live root HWND comparison remains stricter than the initial None check.
         """
+        check = checkpoint or (lambda: None)
         predicate = "provider_property_unavailable"
         try:
+            check()
             current_id = self._runtime_id(root)
             if current_id != root_id:
                 return self._membership_failure(
@@ -385,8 +410,10 @@ class UIABackend:
                     if current_id is None
                     else "root_runtime_id_changed"
                 )
+            check()
             if int(root.ProcessId) != expected["pid"]:
                 return self._membership_failure("root_pid_mismatch")
+            check()
             root_hwnd = getattr(root, "NativeWindowHandle", expected["hwnd"])
             if root_hwnd != expected["hwnd"]:
                 # uiautomation also maps COMError/None to zero; its cause is unknown.
@@ -397,6 +424,7 @@ class UIABackend:
                     if root_hwnd == 0
                     else "root_hwnd_mismatch"
                 )
+            check()
             current_id = self._runtime_id(control)
             if current_id != original_id:
                 return self._membership_failure(
@@ -404,26 +432,31 @@ class UIABackend:
                     if current_id is None
                     else "candidate_runtime_id_changed"
                 )
+            check()
             if int(control.ProcessId) != expected["pid"]:
                 return self._membership_failure("candidate_pid_mismatch")
             predicate = "ancestry_unavailable"
             ancestor = control
             for _ in range(64):
+                check()
                 ancestor_id = self._runtime_id(ancestor)
                 if ancestor_id == root_id:
                     break
+                check()
                 ancestor = ancestor.GetParentControl()
                 if ancestor is None:
                     return self._membership_failure("ancestry_unavailable")
             else:
                 return self._membership_failure("ancestry_limit")
             predicate = "provider_property_unavailable"
+            check()
             hwnd = getattr(control, "NativeWindowHandle", 0)
             if hwnd in (None, 0, expected["hwnd"]):
                 return None
             predicate = "native_membership_unavailable"
             checker = getattr(self.win32, "is_child_window", None)
             if checker is not None:
+                check()
                 return (
                     None
                     if bool(checker(expected["hwnd"], int(hwnd), expected["pid"]))
@@ -432,19 +465,24 @@ class UIABackend:
             user32_factory = getattr(self.win32, "_user32", None)
             if user32_factory is None:
                 return self._membership_failure("native_membership_unavailable")
+            check()
             user32 = user32_factory()
             child_pid = wintypes.DWORD()
+            check()
             child_thread = user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(child_pid))
             if child_thread == 0:
                 return self._membership_failure("native_membership_unavailable")
             user32.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
             user32.IsChild.restype = wintypes.BOOL
+            check()
             member = child_pid.value == expected["pid"] and bool(
                 user32.IsChild(expected["hwnd"], int(hwnd))
             )
             return (
                 None if member else self._membership_failure("candidate_hwnd_membership_mismatch")
             )
+        except _VerificationExpired:
+            raise
         except Exception as exc:
             return self._membership_failure(predicate, exc)
 
@@ -639,6 +677,79 @@ class UIABackend:
             )
         self._state_binding(request, window, stage="binding_before_publication")
         self._require_root_pid(root, expected["pid"], "root_before_publication")
+        if request.get("include_tokens", False):
+            # Issuance reads provider metadata too. Commit the cache only after all
+            # entries still belong to this traversal; a failed state publishes none.
+            previous_tokens = self._tokens.copy()
+            previous_binding = self._target_binding.copy() if self._target_binding else None
+            try:
+                for index, (control, _, _) in enumerate(nodes):
+                    self._require_state_candidate(
+                        control,
+                        original_ids[index],
+                        root,
+                        root_id,
+                        expected,
+                        "token_before_issue",
+                        index,
+                    )
+                    entry = values[index]
+                    self._issue_token(entry, window, root, control)
+                    if "token" in entry:
+                        cached = self._tokens[entry["token"]]
+                        if (
+                            cached["identity"] != expected
+                            or cached["root_id"] != root_id
+                            or cached["element_id"] != original_ids[index]
+                            or any(
+                                entry.get(key) != value for key, value in cached["metadata"].items()
+                            )
+                            or any(
+                                values[0].get(key) != value
+                                for key, value in cached["root_metadata"].items()
+                            )
+                        ):
+                            self._refuse_membership(
+                                "token_after_issue",
+                                index,
+                                self._membership_failure("token_binding_changed"),
+                            )
+                for index, (control, _, _) in enumerate(nodes):
+                    self._require_state_candidate(
+                        control,
+                        original_ids[index],
+                        root,
+                        root_id,
+                        expected,
+                        "token_before_publication",
+                        index,
+                    )
+                    token = values[index].get("token")
+                    if token is not None:
+                        cached = self._tokens[token]
+                        if (
+                            self._metadata(control) != cached["metadata"]
+                            or self._metadata(root) != cached["root_metadata"]
+                        ):
+                            self._refuse_membership(
+                                "token_before_publication",
+                                index,
+                                self._membership_failure("token_metadata_changed"),
+                            )
+                        self._require_state_candidate(
+                            control,
+                            original_ids[index],
+                            root,
+                            root_id,
+                            expected,
+                            "token_after_metadata",
+                            index,
+                        )
+                self._state_binding(request, window, stage="token_binding_before_publication")
+            except Exception:
+                self._tokens = previous_tokens
+                self._target_binding = previous_binding
+                raise
         self._target_binding = {**expected}
         data = {
             "nodes": values,
@@ -674,15 +785,21 @@ class UIABackend:
             )
 
     @staticmethod
-    def _runtime_id(control):
+    def _runtime_id(control, *, checkpoint=None):
         # uiautomation's Element property implicitly Refind()s a missing pointer.
         # Controls obtained from handles/walking must retain their original live pointer.
+        if checkpoint is not None:
+            checkpoint()
         if hasattr(control, "_element") and not control._element:
             raise ValueError("UIA live reference is gone; automatic Refind is forbidden")
         getter = getattr(control, "GetRuntimeId", None)
         if getter is None:
             return None
+        if checkpoint is not None:
+            checkpoint()
         value = getter()
+        if checkpoint is not None:
+            checkpoint()
         if value is None:
             return None
         value = tuple(value)
@@ -697,9 +814,12 @@ class UIABackend:
         # Injectable adapters may lack a process timestamp. Never invent one.
         return {"hwnd": window["hwnd"], "pid": window["pid"], "process_creation_time": None}
 
-    def _bind(self, window, root, control):
+    def _bind(self, window, root, control, *, checkpoint=None):
+        if checkpoint is not None:
+            checkpoint()
         identity = self._window_identity(window)
-        root_id, element_id = self._runtime_id(root), self._runtime_id(control)
+        root_id = self._runtime_id(root, checkpoint=checkpoint)
+        element_id = self._runtime_id(control, checkpoint=checkpoint)
         self._target_binding = {
             **identity,
             "root_runtime_id": list(root_id) if root_id else None,
@@ -743,7 +863,9 @@ class UIABackend:
         entry["token_ttl_seconds"] = 60
         self._issued_this_call += 1
 
-    def _token_control(self, token, window, root):
+    def _token_control(self, token, window, root, *, checkpoint=None):
+        if checkpoint is not None:
+            checkpoint()
         if not isinstance(token, str) or token not in self._tokens:
             raise Refusal("INVALID_TOKEN", "Token is unknown to this UIA worker")
         cached = self._tokens[token]
@@ -751,36 +873,46 @@ class UIABackend:
             del self._tokens[token]
             raise Refusal("EXPIRED_TOKEN", "Token TTL has expired; explicitly discover again")
         try:
+            if checkpoint is not None:
+                checkpoint()
             identity = self._window_identity(window)
+            if checkpoint is not None:
+                checkpoint()
             if identity != cached["identity"]:
                 raise ValueError("Window/process binding changed")
             control = cached["control"]
             if (
-                self._runtime_id(root) != cached["root_id"]
-                or self._runtime_id(cached["root"]) != cached["root_id"]
-                or self._runtime_id(control) != cached["element_id"]
-                or self._metadata(root) != cached["root_metadata"]
-                or self._metadata(cached["root"]) != cached["root_metadata"]
-                or self._metadata(control) != cached["metadata"]
+                self._runtime_id(root, checkpoint=checkpoint) != cached["root_id"]
+                or self._runtime_id(cached["root"], checkpoint=checkpoint) != cached["root_id"]
+                or self._runtime_id(control, checkpoint=checkpoint) != cached["element_id"]
+                or self._metadata(root, checkpoint=checkpoint) != cached["root_metadata"]
+                or self._metadata(cached["root"], checkpoint=checkpoint) != cached["root_metadata"]
+                or self._metadata(control, checkpoint=checkpoint) != cached["metadata"]
             ):
                 raise ValueError("Live root/element identity changed")
             # A still-readable but detached/reparented cached element is not a bound target.
             ancestor = control
             for _ in range(64):
-                if self._runtime_id(ancestor) == cached["root_id"]:
+                if self._runtime_id(ancestor, checkpoint=checkpoint) == cached["root_id"]:
                     break
+                if checkpoint is not None:
+                    checkpoint()
                 ancestor = ancestor.GetParentControl()
+                if checkpoint is not None:
+                    checkpoint()
                 if ancestor is None:
                     raise ValueError("Element is detached from its original root")
             else:
                 raise ValueError("Cannot establish bounded element ancestry")
-            self._bind(window, root, control)
+            self._bind(window, root, control, checkpoint=checkpoint)
             return control
         except Exception as exc:
+            if isinstance(exc, Refusal) and exc.code == "DEADLINE_EXCEEDED":
+                raise
             del self._tokens[token]
             raise Refusal("STALE_TOKEN", "Token binding no longer valid; discover again") from exc
 
-    def _walk(self, root, depth, max_nodes):
+    def _walk(self, root, depth, max_nodes, *, checkpoint=None):
         """Bound sibling walking too: GetChildren would materialize an unbounded list."""
         nodes = []
         truncated = False
@@ -792,6 +924,8 @@ class UIABackend:
                 return
             index = len(nodes)
             nodes.append((control, level, parent))
+            if checkpoint is not None:
+                checkpoint()
             child = control.GetFirstChildControl()
             if child is None:
                 return
@@ -803,6 +937,8 @@ class UIABackend:
                     truncated = True
                     return
                 visit(child, level + 1, index)
+                if checkpoint is not None:
+                    checkpoint()
                 child = child.GetNextSiblingControl()
 
         visit(root, 0, None)
@@ -832,23 +968,33 @@ class UIABackend:
         return selector
 
     @staticmethod
-    def _matches(control, selector):
-        return all(
-            getattr(control, prop) == selector[key]
-            for key, prop in (
-                ("name", "Name"),
-                ("automation_id", "AutomationId"),
-                ("control_type", "ControlType"),
-            )
-            if key in selector
-        )
+    def _matches(control, selector, *, checkpoint=None):
+        for key, prop in (
+            ("name", "Name"),
+            ("automation_id", "AutomationId"),
+            ("control_type", "ControlType"),
+        ):
+            if key not in selector:
+                continue
+            if checkpoint is not None:
+                checkpoint()
+            actual = getattr(control, prop)
+            if checkpoint is not None:
+                checkpoint()
+            if actual != selector[key]:
+                return False
+        return True
 
-    def _select(self, root, selector, depth, maximum, *, allow_missing=False):
+    def _select(self, root, selector, depth, maximum, *, allow_missing=False, checkpoint=None):
         conditions = self._selector(selector)
-        nodes, truncated = self._walk(root, depth, maximum)
+        nodes, truncated = self._walk(root, depth, maximum, checkpoint=checkpoint)
+        if checkpoint is not None:
+            checkpoint()
         if truncated:
             raise Refusal("SEARCH_TRUNCATED", "Cannot establish uniqueness in a truncated tree")
-        matches = [node for node, _, _ in nodes if self._matches(node, conditions)]
+        matches = [
+            node for node, _, _ in nodes if self._matches(node, conditions, checkpoint=checkpoint)
+        ]
         index = conditions.get("index")
         if index is not None:
             matches = matches[index : index + 1]
@@ -1053,6 +1199,24 @@ class UIABackend:
     def _execute(self, request, action):
         if action not in UIA_ACTIONS:
             raise Refusal("UNSUPPORTED_ACTION", f"Unsupported UIA action: {action}")
+        checkpoint = None
+        if action == "set_value":
+            timeout = request.get("timeout", 5)
+            deadline = request.get("_deadline_monotonic", self._execute_started + 120)
+            if (
+                type(timeout) not in (int, float)
+                or not math.isfinite(timeout)
+                or not 0 <= timeout <= 120
+                or type(deadline) not in (int, float)
+                or not math.isfinite(deadline)
+            ):
+                raise Refusal("INVALID_TIMEOUT", "Invalid set_value deadline or timeout")
+            self._value_deadline = min(deadline, self._execute_started + timeout)
+
+            def checkpoint():
+                if self._clock() >= self._value_deadline:
+                    raise Refusal("DEADLINE_EXCEEDED", "set_value deadline expired before mutation")
+
         if request.get("token") is not None and request.get("selector") is not None:
             raise Refusal("INVALID_SELECTOR", "token and selector are mutually exclusive")
         if action == "list":
@@ -1080,7 +1244,11 @@ class UIABackend:
             raise Refusal("INVALID_LIMIT", "max_nodes must be an integer between 1 and 5000")
         if action == "state" and not request.get("target"):
             raise Refusal("TARGET_REQUIRED", "state requires an explicit target")
+        if checkpoint is not None:
+            checkpoint()
         window = self.win32.resolve_window(request.get("target"))
+        if checkpoint is not None:
+            checkpoint()
         if action == "state":
             self._state_binding(request, window)
         try:
@@ -1090,15 +1258,23 @@ class UIABackend:
                 "initial_root", 0, self._membership_failure("root_unavailable", exc)
             )
         # ProcessId is a read property, NOT a supported search keyword in uiautomation.
+        if checkpoint is not None:
+            checkpoint()
         self._require_root_pid(root, window["pid"], "initial_root")
+        if checkpoint is not None:
+            checkpoint()
+        root_pointer = getattr(root, "_element", None) if action == "set_value" else None
         try:
-            self._bind(window, root, root)
+            self._bind(window, root, root, checkpoint=checkpoint)
         except Exception as exc:
+            if isinstance(exc, Refusal) and exc.code == "DEADLINE_EXCEEDED":
+                raise
             self._refuse_membership(
                 "initial_root_binding",
                 0,
                 self._membership_failure("provider_property_unavailable", exc),
             )
+        initial_binding = self._target_binding.copy()
         if action == "find":
             if request.get("token") is not None:
                 raise Refusal("INVALID_QUERY", "find discovers using query/selector, not token")
@@ -1110,9 +1286,13 @@ class UIABackend:
         control = root
         selector = request.get("selector")
         if request.get("token") is not None:
-            control = self._token_control(request["token"], window, root)
+            control = self._token_control(request["token"], window, root, checkpoint=checkpoint)
         elif selector is not None:
-            control = self._select(root, selector, depth, maximum)
+            control = self._select(root, selector, depth, maximum, checkpoint=checkpoint)
+        if action == "set_value":
+            return self._set_value(
+                request, window, root, control, initial_binding, root_pointer, depth, maximum
+            )
         self._bind(window, root, control)
         if action in {"tree", "text"}:
             nodes, truncated = self._walk(control, depth, maximum)
@@ -1185,19 +1365,162 @@ class UIABackend:
                     key: value for key, value in data["patterns"].items() if value is not None
                 }
             return result("ok", action, method="uia", data=data)
-        private_value = action == "set_value" and not self._aggregate_value_safe(
-            control, depth, maximum
+        return self._mutate(control, action, request)
+
+    def _set_value(self, request, window, root, control, binding, root_pointer, depth, maximum):
+        """One write, then bounded reads of the pinned live reference (never Refind)."""
+        expected_identity = {key: binding[key] for key in ("hwnd", "pid", "process_creation_time")}
+        root_id = tuple(binding["root_runtime_id"] or ())
+        deadline = self._value_deadline
+
+        def checkpoint():
+            if self._clock() >= deadline:
+                raise _VerificationExpired
+
+        def guard():
+            checkpoint()
+            for node, pointer in ((root, root_pointer), (control, control_pointer)):
+                if hasattr(node, "_element") and (
+                    not node._element or node._element is not pointer
+                ):
+                    raise Refusal("STALE_TARGET", "UIA live reference changed")
+            if self._window_identity(window) != expected_identity:
+                raise Refusal("STALE_TARGET", "Window/process identity changed")
+            failure = self._state_live_candidate(
+                control, control_id, root, root_id, expected_identity, checkpoint=checkpoint
+            )
+            if failure is not None:
+                self._refuse_membership("set_value_verification", 0, failure)
+            checkpoint()
+            current_root_id = self._runtime_id(root)
+            checkpoint()
+            current_control_id = self._runtime_id(control)
+            checkpoint()
+            current_identity = self._window_identity(window)
+            checkpoint()
+            if (
+                current_root_id != root_id
+                or current_control_id != control_id
+                or current_identity != expected_identity
+                or any(
+                    hasattr(node, "_element") and node._element is not pointer
+                    for node, pointer in ((root, root_pointer), (control, control_pointer))
+                )
+            ):
+                raise Refusal("STALE_TARGET", "UIA live identity changed")
+
+        private = False
+
+        def privacy():
+            nonlocal private
+            guard()
+            private = (
+                not self._aggregate_value_safe(control, depth, maximum, checkpoint=checkpoint)
+                or private
+            )
+            guard()
+
+        returned = None
+        try:
+            checkpoint()
+            control_id = self._state_runtime_id(control, "set_value_initial_control", 0)
+            checkpoint()
+            control_pointer = getattr(control, "_element", None)
+            if (
+                not root_id
+                or not control_id
+                or any(type(value) is not int or value <= 0 for value in expected_identity.values())
+            ):
+                raise Refusal("STALE_TARGET", "Reliable set_value identity is unavailable")
+            guard()
+            self._target_binding = {**binding, "element_runtime_id": list(control_id)}
+            if not isinstance(request.get("value"), str):
+                raise Refusal("INVALID_VALUE", "set_value requires a string")
+            pattern = self._pattern(control, "Value", checkpoint=checkpoint)
+            guard()
+            if pattern is None:
+                raise Refusal("UNSUPPORTED_PATTERN", "ValuePattern is not supported")
+            readonly = pattern.IsReadOnly
+            guard()
+            if readonly:
+                raise Refusal("READ_ONLY", "Value pattern is read-only")
+            privacy()
+            before = pattern.Value
+            guard()
+            privacy()
+            setter = pattern.SetValue
+            guard()
+            checkpoint()
+            self._may_have_acted = True
+            returned = setter(request["value"], waitTime=0)
+            deadline = min(self._value_deadline, self._clock() + 0.6)
+            while True:
+                privacy()
+                checkpoint()
+                after = pattern.Value
+                guard()
+                privacy()
+                if after == request["value"]:
+                    break
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise _VerificationExpired
+                self._sleep(min(0.05, remaining))
+            data = {
+                "before": None if private else self._bounded_property(before),
+                "after": None if private else self._bounded_property(after),
+                "pattern_returned": returned if type(returned) in (bool, type(None)) else None,
+            }
+            if private:
+                data["value_redacted"] = True
+            checkpoint()
+            return result("verified", "set_value", method="uia", data=data)
+        except _VerificationExpired:
+            if not self._may_have_acted:
+                raise Refusal(
+                    "DEADLINE_EXCEEDED", "set_value deadline expired before mutation"
+                ) from None
+            return self._readback_timeout(returned)
+        except (Refusal, default_win32.TargetError) as exc:
+            if not self._may_have_acted:
+                raise
+            response = result(
+                "unknown",
+                "set_value",
+                method="uia",
+                may_have_acted=True,
+                code=exc.code,
+                message="set_value verification lost its live target binding",
+            )
+            if isinstance(exc, Refusal) and exc.details is not None:
+                response["error"]["details"] = exc.details
+            return response
+
+    @staticmethod
+    def _readback_timeout(returned):
+        data = {
+            "before": None,
+            "after": None,
+            "value_redacted": True,
+            "pattern_returned": returned if type(returned) in (bool, type(None)) else None,
+        }
+        return result(
+            "unknown",
+            "set_value",
+            method="uia",
+            data=data,
+            may_have_acted=True,
+            code="READBACK_TIMEOUT",
+            message="Value was not confirmed before the verification deadline",
         )
-        return self._mutate(control, action, request, private_value=private_value)
 
     @staticmethod
     def _bounded_property(value):
         return value[:4096] if isinstance(value, str) else value
 
-    def _mutate(self, control, action, request, *, private_value=False):
+    def _mutate(self, control, action, request):
         pattern_name = {
             "invoke": "Invoke",
-            "set_value": "Value",
             "toggle": "Toggle",
             "select": "SelectionItem",
             "expand": "ExpandCollapse",
@@ -1211,11 +1534,9 @@ class UIABackend:
         expected = None
         before = None
         readback = None
-        private = False
         args = []
         method = {
             "invoke": "Invoke",
-            "set_value": "SetValue",
             "toggle": "Toggle",
             "select": "Select",
             "expand": "Expand",
@@ -1223,19 +1544,7 @@ class UIABackend:
             "scroll_into_view": "ScrollIntoView",
             "scroll": "Scroll",
         }[action]
-        if action == "set_value":
-            if not isinstance(request.get("value"), str):
-                raise Refusal("INVALID_VALUE", "set_value requires a string")
-            if pattern.IsReadOnly:
-                raise Refusal("READ_ONLY", "Value pattern is read-only")
-            private = self._password(control) is not False or private_value
-            before, expected = pattern.Value, request["value"]
-
-            def readback():
-                return pattern.Value
-
-            args = [expected]
-        elif action == "toggle":
+        if action == "toggle":
             before = int(pattern.ToggleState)
             if before not in (0, 1, 2):
                 raise Refusal("INVALID_STATE", "Invalid toggle state")
@@ -1278,15 +1587,12 @@ class UIABackend:
             args = [enum, no_amount] if axis == "Horizontal" else [no_amount, enum]
         self._may_have_acted = True
         returned = getattr(pattern, method)(*args, waitTime=0)
-        private = action == "set_value" and (private or self._password(control) is not False)
         # Pattern methods are not obliged to return a boolean; never publish an
         # arbitrary provider object/string (which can contain entered text).
         data = {
-            "before": None if private else self._bounded_property(before),
+            "before": self._bounded_property(before),
             "pattern_returned": returned if type(returned) in (bool, type(None)) else None,
         }
-        if private:
-            data["value_redacted"] = True
         if readback is None:
             if returned is False:
                 return result(
@@ -1300,7 +1606,7 @@ class UIABackend:
                 )
             return result("invoked", action, method="uia", data=data)
         after = readback()
-        data["after"] = None if private else self._bounded_property(after)
+        data["after"] = self._bounded_property(after)
         if action == "toggle":
             verified = after in (0, 1, 2) and after != before
         elif action == "scroll":

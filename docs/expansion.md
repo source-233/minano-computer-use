@@ -4,6 +4,12 @@ Video implementation note: the 0.3.1 backend uses PyAV in an isolated Python
 worker. External FFmpeg references below describe historical implementation;
 the output, cancellation and safe-artifact contracts continue to apply.
 
+UIA implementation note: 0.5.1 also issues tokens from `state(include_tokens=True)`
+and adds bounded, same-live-element verification after a single `set_value` write.
+The 600ms verification ceiling shares the existing call deadline, does not
+re-search selectors, and never repeats a mutation. Other mutation readbacks and
+explicit `wait_for` semantics below remain unchanged.
+
 User authorized all candidates in computer-use-comparison.md, not a new full Agent.
 Keep seven tools, strict UIA default, no global MCP install, no automatic commit.
 
@@ -50,7 +56,8 @@ complete successful search, not provider failure/truncation. Broker sends `_dead
 absolute deadline with response reserve; UIA polls read-only until deadline, never replay mutation.
 Return verified on match, error code CONDITION_TIMEOUT plus last_observation on expiry;
 backend handles missing/ambiguous/stale safely. `post_action_wait` is not default random sleep;
-use explicit wait_for after a single write and keep invoked/unknown honest.
+use bounded same-reference confirmation for `set_value`; other mutations still require an
+explicit read-only wait after their single write, preserving invoked/unknown honestly.
 
 ### Cancellation (C contract, B integration)
 `control.OperationCancelled(Exception)` code CANCELLED.
