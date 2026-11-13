@@ -139,7 +139,7 @@ def test_force_focus_disabled_and_already_foreground_no_reactivation():
     assert response["status"] == "verified"
     assert response["method"] == "AttachThreadInput+SetForegroundWindow"
     assert response["delivery"] == "native"
-    assert response["target_binding"] == {"hwnd": 23, "pid": 123}
+    assert response["target_binding"] == {"hwnd": 23, "pid": 123, "process_creation_time": None}
     assert response["no_op"] and response["target_foreground"]
     assert not response["focus_changed"] and not response["may_have_acted"]
     assert not adapter.calls and not adapter.events

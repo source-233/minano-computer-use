@@ -5,13 +5,23 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import os
 import platform
 import threading
 import time
+import uuid
 from pathlib import Path
 
+from . import __version__ as VERSION
 from .broker import UIABroker
-from .contracts import READ_ACTIONS, STOP_STATUSES, UIA_ACTIONS, result
+from .contracts import (
+    READ_ACTIONS,
+    STOP_STATUSES,
+    UIA_ACTIONS,
+    failure_details,
+    receipt_facts,
+    result,
+)
 from .control import OperationCancelled, OperationController
 from .output import bound_result, validate_budget
 
@@ -65,6 +75,9 @@ class Runtime:
         message=None,
     ):
         # Deprecated constructor switch: permission is selected per call only.
+        self._instance_id = uuid.uuid4().hex
+        self._init_pid = os.getpid()
+        self._started_at = time.time()
         self.allow_native = True
         self.allow_shell = allow_shell
         self.allow_process_control = allow_process_control
@@ -114,6 +127,8 @@ class Runtime:
                 from .trace import TraceRecorder
 
                 self._trace = TraceRecorder(self._artifacts(), enabled=True)
+            from .trace import _cleanup_facts
+
             # The recorder independently allowlists. Never hand it raw user input.
             safe_request = {"call_id": response.get("call_id")}
             safe_result = {
@@ -131,12 +146,20 @@ class Runtime:
                 if key in response
             }
             if isinstance(response.get("error"), dict):
-                safe_result["error"] = {"code": response["error"].get("code")}
+                safe_result["error"] = {
+                    "code": response["error"].get("code"),
+                    "details": failure_details(response["error"].get("details")),
+                }
+            if isinstance(response.get("receipt"), dict):
+                safe_result["receipt"] = receipt_facts(response["receipt"])
             binding = response.get("target_binding")
             if isinstance(binding, dict):
                 safe_result["target_binding"] = {
                     key: binding[key] for key in ("pid", "hwnd") if type(binding.get(key)) is int
                 }
+                safe_result["target_binding"]["process_creation_time"] = binding.get(
+                    "process_creation_time"
+                )
             data = response.get("data", {})
             if operation == "play":
                 data = data.get("actions", {}).get("data", {})
@@ -147,19 +170,35 @@ class Runtime:
                     if type(data.get(key)) in (int, bool)
                 }
                 cleanup = data.get("cleanup")
-                if isinstance(cleanup, dict):
-                    safe_data["cleanup"] = {"status": cleanup.get("status")}
+                cleanup = _cleanup_facts(cleanup)
+                if cleanup:
+                    safe_data["cleanup"] = cleanup
                 if isinstance(data.get("results"), list):
                     safe_data["results"] = []
                     for item in data["results"]:
                         observed = item.get("result", {})
                         facts = {
                             key: observed[key]
-                            for key in ("status", "method", "cancelled")
+                            for key in ("status", "method", "cancelled", "may_have_acted")
                             if key in observed
                         }
                         if isinstance(observed.get("error"), dict):
-                            facts["error"] = {"code": observed["error"].get("code")}
+                            facts["error"] = {
+                                "code": observed["error"].get("code"),
+                                "details": failure_details(observed["error"].get("details")),
+                            }
+                        if isinstance(observed.get("receipt"), dict):
+                            facts["receipt"] = receipt_facts(observed["receipt"])
+                        cleanup = _cleanup_facts(observed.get("cleanup"))
+                        if cleanup:
+                            facts["cleanup"] = cleanup
+                        observed_binding = observed.get("target_binding")
+                        if isinstance(observed_binding, dict):
+                            facts["target_binding"] = {
+                                key: observed_binding[key]
+                                for key in ("pid", "hwnd", "process_creation_time")
+                                if key in observed_binding
+                            }
                         safe_data["results"].append({"index": item.get("index"), "result": facts})
                 safe_result["data"] = safe_data
             self._trace.record(operation, safe_request, safe_result)
@@ -327,9 +366,24 @@ class Runtime:
         return self._capture
 
     def _map_actions(self, actions, coordinate_space, capture_id, target, scope, native=False):
+        if native and coordinate_space == "image":
+            # Play capture runs on another thread and may remember newer frames.
+            # All points and pins in this plan must use one immutable source frame.
+            with self._coordinates()._lock:
+                return self._map_actions_locked(
+                    actions, coordinate_space, capture_id, target, scope, native
+                )
+        return self._map_actions_locked(
+            actions, coordinate_space, capture_id, target, scope, native
+        )
+
+    def _map_actions_locked(
+        self, actions, coordinate_space, capture_id, target, scope, native=False
+    ):
         manager = self._coordinates()
         if native:
             resolved = {}
+            bindings = {}
 
             def viewport(selected):
                 if selected not in resolved:
@@ -361,15 +415,21 @@ class Runtime:
                         provenance = concrete
                     if "target" in action:
                         action["target"] = concrete
-                mapped.extend(
-                    manager.map_actions(
-                        [action],
-                        coordinate_space=coordinate_space,
-                        capture_id=capture_id,
-                        target=provenance,
-                        scope=scope,
-                    )
+                converted = manager.map_actions(
+                    [action],
+                    coordinate_space=coordinate_space,
+                    capture_id=capture_id,
+                    target=bindings.get(provenance, provenance),
+                    scope=scope,
+                    bind=coordinate_space == "image",
                 )
+                if converted and "_coordinate_binding" in converted[0]:
+                    bindings.setdefault(provenance, converted[0]["_coordinate_binding"])
+                mapped.extend(converted)
+            for action in mapped:
+                binding = action.get("_coordinate_binding")
+                if binding is not None:
+                    action["target"] = f"hwnd:{binding['hwnd']}"
             return mapped
         # Each native action may override the outer target. Validate every binding
         # before the first effect; checking only the outer target would allow a
@@ -593,6 +653,8 @@ class Runtime:
         max_dim=800,
         format="jpeg",
         quality=75,
+        capture_mode="screen",
+        allow_fallback=False,
         timeout=5.0,
         depth=8,
         max_nodes=500,
@@ -634,6 +696,16 @@ class Runtime:
             raise ValueError("format must be png, jpeg, or webp")
         if quality is not None and (type(quality) is not int or not 1 <= quality <= 95):
             raise ValueError("quality must be an integer in [1, 95]")
+        if not isinstance(capture_mode, str) or capture_mode not in {
+            "auto",
+            "screen",
+            "window",
+            "printwindow",
+            "wgc",
+        }:
+            raise ValueError("capture_mode must be auto, screen, window, printwindow, or wgc")
+        if type(allow_fallback) is not bool:
+            raise ValueError("allow_fallback must be a boolean")
         began = time.monotonic()
         deadline = min(deadline, began + timeout) if deadline is not None else began + timeout
         self._remaining(deadline, operation)
@@ -693,6 +765,8 @@ class Runtime:
                         max_dim=max_dim,
                         format=format,
                         quality=quality,
+                        capture_mode=capture_mode,
+                        allow_fallback=allow_fallback,
                     )
                     if isinstance(captured, dict):
                         data["component_errors"][component] = captured
@@ -956,8 +1030,11 @@ class Runtime:
         timed=False,
         dynamic=False,
         input_mode=None,
+        feedback="compact",
     ):
         self._check_open()
+        if not isinstance(feedback, str) or feedback not in {"compact", "detailed"}:
+            raise ValueError("feedback must be compact or detailed")
         if not isinstance(native, bool) or not isinstance(stop_on_error, bool):
             raise ValueError("native and stop_on_error must be booleans")
         _number(timeout, "timeout", 0.001, 120)
@@ -974,8 +1051,8 @@ class Runtime:
             name = action.get("action", action.get("type") if native or message else None)
             if not isinstance(name, str):
                 raise ValueError("Each action requires an action name")
-            if {"native", "input_mode", "key_method"} & set(action):
-                raise ValueError("Choose input mode/key_method once for the entire batch")
+            if {"native", "input_mode", "key_method", "feedback"} & set(action):
+                raise ValueError("Choose input mode/key_method/feedback once for the entire batch")
             if dynamic and name in {"probe", "until", "shot"}:
                 if message:
                     raise ValueError(f"Unsupported message action: {name}")
@@ -1050,6 +1127,7 @@ class Runtime:
         dynamic=None,
         input_mode=None,
         deadline=None,
+        feedback="compact",
     ):
         results = []
         cleanup = None
@@ -1059,6 +1137,7 @@ class Runtime:
         try:
             for index, item in enumerate(actions):
                 action = dict(item)
+                coordinate_binding = action.pop("_coordinate_binding", None)
                 at = action.pop("at", 0)
                 began = time.monotonic()
                 dispatched = False
@@ -1098,16 +1177,34 @@ class Runtime:
                             for key, value in action.items()
                             if key not in {"target", "timeout"}
                         }
+                        if coordinate_binding is not None:
+                            parameter = inspect.signature(backend.execute).parameters.get(
+                                "coordinate_binding"
+                            )
+                            if parameter is None or parameter.kind not in {
+                                inspect.Parameter.KEYWORD_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            }:
+                                raise ValueError(
+                                    "Message backend cannot enforce image coordinate binding"
+                                )
+                            self._coordinates().validate_binding(
+                                coordinate_binding, int(action["target"][5:])
+                            )
                         dispatched = True
                         response = backend.execute(
                             payload,
                             action["target"],
                             timeout=min(action.get("timeout", timeout), remaining),
+                            **(
+                                {"coordinate_binding": coordinate_binding}
+                                if coordinate_binding is not None
+                                else {}
+                            ),
                         )
                     elif native:
-                        self._input().set_cancel_event(operation.event)
-                        dispatched = True
                         backend = self._input()
+                        backend.set_cancel_event(operation.event)
                         # Inspect before dispatch; never retry a TypeError after input.
                         parameters = inspect.signature(backend.execute).parameters
                         payload = {
@@ -1115,16 +1212,47 @@ class Runtime:
                             for key, value in action.items()
                             if key not in {"target", "timeout"}
                         }
-                        if "key_method" in parameters:
-                            response = backend.execute(
-                                payload, action["target"], key_method=key_method
-                            )
-                        else:
-                            if key_method != "scancode":
+                        supports_keywords = any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        )
+                        options = {}
+                        for name, selected in (("key_method", key_method), ("feedback", feedback)):
+                            parameter = parameters.get(name)
+                            if supports_keywords or (
+                                parameter is not None
+                                and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+                            ):
+                                options[name] = selected
+                            elif name == "key_method" and selected != "scancode":
                                 raise ValueError(
                                     "Injected native backend does not support key_method"
                                 )
-                            response = backend.execute(action, action["target"])
+                        if coordinate_binding is not None:
+                            # **kwargs alone does not prove that a legacy backend
+                            # enforces the pin; require the explicit internal API.
+                            for name in ("coordinate_binding", "coordinate_validator"):
+                                parameter = parameters.get(name)
+                                if parameter is None or parameter.kind not in {
+                                    inspect.Parameter.KEYWORD_ONLY,
+                                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                }:
+                                    raise ValueError(
+                                        "Native backend cannot enforce image coordinate binding"
+                                    )
+                            self._coordinates().validate_binding(
+                                coordinate_binding, int(action["target"][5:])
+                            )
+                            options.update(
+                                coordinate_binding=coordinate_binding,
+                                coordinate_validator=self._coordinates().validate_binding,
+                            )
+                        dispatched = True
+                        response = backend.execute(
+                            payload if "key_method" in options else action,
+                            action["target"],
+                            **options,
+                        )
                     else:
                         dispatched = True
                         response = self._broker_call(
@@ -1138,7 +1266,11 @@ class Runtime:
                 except OperationCancelled:
                     response = self._cancelled(action["action"], mutation and dispatched)
                 except Exception as exc:
-                    response = self._failure(action["action"], exc, "unknown")
+                    response = self._failure(
+                        action["action"],
+                        exc,
+                        "unknown" if dispatched or coordinate_binding is None else "refused",
+                    )
                     response["may_have_acted"] = mutation and dispatched
                 response.setdefault(
                     "delivery",
@@ -1293,6 +1425,7 @@ class Runtime:
         scope="default",
         _request_cancel=None,
         input_mode=None,
+        feedback="compact",
     ):
         def execute(operation):
             try:
@@ -1312,7 +1445,13 @@ class Runtime:
                         selected = target if focus is True else focus
                         plan = [{"action": "force_focus", "target": _target(selected)}, *actions]
                 prepared = self._validate_actions(
-                    plan, target, physical, stop_on_error, timeout, input_mode=mode
+                    plan,
+                    target,
+                    physical,
+                    stop_on_error,
+                    timeout,
+                    input_mode=mode,
+                    feedback=feedback,
                 )
                 prepared = self._map_actions(
                     prepared,
@@ -1334,6 +1473,7 @@ class Runtime:
                 key_method=key_method,
                 input_mode=mode,
                 deadline=feedback_deadline,
+                feedback=feedback,
             )
             response["delivery"] = mode if mode != "uia" else "accessibility"
             if screenshot and not operation.event.is_set() and not response.get("cancelled"):
@@ -1515,6 +1655,7 @@ class Runtime:
         quality=75,
         _request_cancel=None,
         input_mode=None,
+        feedback="compact",
     ):
         def execute(operation):
             try:
@@ -1560,6 +1701,7 @@ class Runtime:
                     timed=script is None,
                     dynamic=script is not None,
                     input_mode=mode,
+                    feedback=feedback,
                 )
                 prepared = self._map_actions(
                     prepared,
@@ -1736,6 +1878,7 @@ class Runtime:
                     dynamic=dynamic if script is not None else None,
                     input_mode=mode,
                     deadline=probe_deadline,
+                    feedback=feedback,
                 )
             finally:
                 if script is not None:
@@ -1806,6 +1949,12 @@ class Runtime:
                 fallbacks=[],
                 data={
                     "platform": platform.system(),
+                    "package_version": VERSION,
+                    "instance_id": self._instance_id,
+                    "pid": self._init_pid,
+                    "started_at": self._started_at,
+                    "build": None,
+                    "revision": None,
                     "python": platform.python_version(),
                     "allow_native": self.allow_native,
                     "input_policy": "explicit_per_call",

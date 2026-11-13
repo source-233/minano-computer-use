@@ -16,6 +16,12 @@ class CoordinateError(ValueError):
     """The requested mapping cannot be proven safe."""
 
 
+class StaleCaptureError(CoordinateError):
+    """An internally pinned image recipient changed before dispatch."""
+
+    code = "STALE_CAPTURE"
+
+
 def _process_name(pid: int) -> str | None:
     """Read an exact executable basename, without shell/process-service access."""
     if os.name != "nt":
@@ -184,6 +190,15 @@ class CoordinateManager:
         validate_window(metadata, current, geometry=geometry)
         return current
 
+    def validate_binding(self, binding: dict[str, Any], hwnd: int) -> dict[str, Any]:
+        """Recheck an internal dispatch pin, never the latest frame or its title."""
+        if binding.get("hwnd") != hwnd:
+            raise StaleCaptureError("input recipient does not match captured window HWND")
+        try:
+            return self._current(binding)
+        except CoordinateError as exc:
+            raise StaleCaptureError(str(exc)) from exc
+
     @staticmethod
     def _screen_surface(target: Any) -> bool:
         return isinstance(target, str) and (
@@ -191,7 +206,7 @@ class CoordinateManager:
             or target.startswith("display:")
         )
 
-    def _validate_recipient(self, target: Any) -> None:
+    def _validate_recipient(self, target: Any) -> dict[str, Any]:
         """Validate an explicit input window, not the image surface provenance.
 
         No foreground lookup or surface-to-window inference is permitted. The
@@ -234,6 +249,7 @@ class CoordinateManager:
         if rect[2] <= rect[0] or rect[3] <= rect[1]:
             raise CoordinateError("input recipient has invalid window geometry")
         self._current(recipient)
+        return recipient
 
     @staticmethod
     def _region_values(region: Any, label: str = "region") -> tuple[float, float, float, float]:
@@ -328,6 +344,8 @@ class CoordinateManager:
         capture_id: str | None = None,
         target: Any = None,
         scope: str = "default",
+        *,
+        bind: bool = False,
     ) -> list[dict[str, Any]]:
         if coordinate_space not in {"screen", "image"}:
             raise CoordinateError("coordinate_space must be screen or image")
@@ -339,6 +357,7 @@ class CoordinateManager:
         if frame is None or capture_id is not None and frame.capture_id != capture_id:
             raise CoordinateError("unknown, stale, or wrong-scope capture_id")
         metadata = frame.metadata
+        binding = None
         if metadata.get("hwnd") is not None:
             self._current(metadata)
             if target is None:
@@ -350,12 +369,13 @@ class CoordinateManager:
                 validate_window(metadata, live)
             except Exception as exc:
                 raise CoordinateError("target does not match the capture") from exc
+            binding = metadata
         else:
             if not self._screen_surface(metadata.get("target")):
                 raise CoordinateError("capture has no recognized screen surface provenance")
             if target is None:
                 raise CoordinateError("image input requires an explicit concrete window recipient")
-            self._validate_recipient(target)
+            binding = self._validate_recipient(target)
         transform = metadata.get("physical_transform")
         if not isinstance(transform, dict):
             raise CoordinateError("capture has no known physical_transform")
@@ -380,6 +400,10 @@ class CoordinateManager:
         for action in mapped:
             if not isinstance(action, dict):
                 raise CoordinateError("actions must contain objects")
+            if bind:
+                # Generated only after the public whole-plan validation. Keep the
+                # original physical surface/recipient, not a mutable latest frame.
+                action["_coordinate_binding"] = copy.deepcopy(binding)
             if action.get("action", action.get("type")) in {"look", "mouse_move_relative"}:
                 continue
             if "x" in action or "y" in action:

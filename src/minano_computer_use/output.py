@@ -3,6 +3,8 @@
 import copy
 import json
 
+from .contracts import failure_details, receipt_facts
+
 DEFAULT_CHARS = 24000
 DEFAULT_BYTES = 65536
 
@@ -42,6 +44,8 @@ def _clip(value, string_limit):
             "element_token",
             "target_binding",
             "selector_suggestion",
+            "process_creation_time",
+            "root_binding",
         }
         return {
             key: (item if key in identity else _clip(item, string_limit))
@@ -100,6 +104,33 @@ def _guard_node_references(value):
     return guarded
 
 
+def _guard_receipts(value):
+    """Copy only changed containers; full public receipts have bounded safe events."""
+    guarded = value
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"target_binding", "root_binding", "selector_suggestion"}:
+                continue
+            if key == "receipt" and isinstance(item, dict):
+                replacement = receipt_facts(item, include_recipients=True)
+                if replacement == item:
+                    replacement = item
+            else:
+                replacement = _guard_receipts(item)
+            if replacement is not item:
+                if guarded is value:
+                    guarded = value.copy()
+                guarded[key] = replacement
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            replacement = _guard_receipts(item)
+            if replacement is not item:
+                if guarded is value:
+                    guarded = value.copy()
+                guarded[index] = replacement
+    return guarded
+
+
 def _failure_summaries(value):
     """Extract compact failure facts before any large list is reduced."""
     found = []
@@ -112,26 +143,198 @@ def _failure_summaries(value):
                     outcome = entry["result"]
                     if outcome.get("status") not in {"refused", "error", "unknown", "partial"}:
                         continue
-                    summary = {
-                        "index": entry.get("index"),
-                        "result": {
-                            name: outcome[name]
-                            for name in (
-                                "status",
-                                "operation",
-                                "method",
-                                "may_have_acted",
-                                "cancelled",
-                            )
-                            if name in outcome
-                        },
-                    }
-                    error = outcome.get("error")
-                    if isinstance(error, dict):
-                        summary["result"]["error"] = {"code": str(error.get("code", "ERROR"))[:80]}
+                    summary = {"index": entry.get("index"), "result": _outcome_summary(outcome)}
                     found.append(summary)
             elif isinstance(item, dict):
                 found.extend(_failure_summaries(item))
+    return found
+
+
+def _component_failure_summaries(value, *, source=None):
+    """Keep state component facts, never provider text or arbitrary component keys."""
+    found = []
+    if not isinstance(value, dict):
+        return found
+    data = value.get("data")
+    if not isinstance(data, dict):
+        return found
+    failures = data.get("component_errors")
+    if value.get("operation") == "state" and isinstance(failures, dict):
+        for component in ("uia", "screenshot", "binding"):
+            failure = failures.get(component)
+            if not isinstance(failure, dict) or failure.get("status") not in {
+                "refused",
+                "error",
+                "unknown",
+                "partial",
+            }:
+                continue
+            summary = {"component": component, "status": failure["status"]}
+            if source is not None:
+                summary["source"] = source
+            if failure.get("operation") in {"state", "uia", "screenshot"}:
+                summary["operation"] = failure["operation"]
+            error = failure.get("error")
+            if isinstance(error, dict):
+                # Codes are static identifiers, not an alternate provider-text channel.
+                code = error.get("code")
+                if not (
+                    isinstance(code, str)
+                    and 0 < len(code) <= 80
+                    and all(char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789" for char in code)
+                ):
+                    code = "ERROR"
+                summary["error"] = _error_summary({**error, "code": code})
+            found.append(summary)
+    # Follow result envelopes only: similarly named application data is not state evidence.
+    for key in ("after", "actions"):
+        found.extend(
+            _component_failure_summaries(
+                data.get(key), source="after" if key == "after" else source
+            )
+        )
+    for entry in data.get("results", []) if isinstance(data.get("results"), list) else []:
+        if isinstance(entry, dict):
+            found.extend(_component_failure_summaries(entry.get("result"), source=source))
+    # At most one record per fixed component; recursive wrappers cannot amplify output.
+    unique = {}
+    for summary in found:
+        unique.setdefault(summary["component"], summary)
+    return list(unique.values())
+
+
+def _error_summary(error):
+    summary = {"code": str(error.get("code", "ERROR"))[:80]}
+    details = failure_details(error.get("details"))
+    if details:
+        summary["details"] = details
+    return summary
+
+
+def _outcome_summary(outcome, *, _include_cleanup=True):
+    summary = {
+        name: outcome[name]
+        for name in (
+            "status",
+            "operation",
+            "method",
+            "may_have_acted",
+            "cancelled",
+            "consumption_verified",
+            "release_unconfirmed",
+        )
+        if name in outcome
+    }
+    if isinstance(outcome.get("error"), dict):
+        summary["error"] = _error_summary(outcome["error"])
+    receipt = receipt_facts(outcome.get("receipt"))
+    if receipt:
+        summary["receipt"] = receipt
+    cleanup = outcome.get("cleanup")
+    if (
+        _include_cleanup
+        and isinstance(cleanup, dict)
+        and cleanup.get("status")
+        in ("ok", "invoked", "verified", "refused", "error", "unknown", "partial")
+    ):
+        summary["cleanup"] = _outcome_summary(cleanup, _include_cleanup=False)
+    return summary
+
+
+def _receipt_core(value):
+    """Keep exact delivery totals, including explicitly unknown acceptance."""
+    facts = receipt_facts(value)
+    return {
+        key: facts[key]
+        for key in ("requested_events", "accepted_events", "unknown_events")
+        if key in facts
+    }
+
+
+def _critical_outcome(outcome, *, _include_cleanup=True):
+    """Smallest mutation evidence; optional method/phase/timing facts go first."""
+    facts = {
+        key: outcome[key]
+        for key in ("status", "may_have_acted", "cancelled", "release_unconfirmed")
+        if key in outcome
+    }
+    if isinstance(outcome.get("error"), dict):
+        facts["error"] = _error_summary(outcome["error"])
+    if isinstance(outcome.get("receipt"), dict):
+        facts["receipt"] = _receipt_core(outcome["receipt"])
+    cleanup = outcome.get("cleanup")
+    if (
+        _include_cleanup
+        and isinstance(cleanup, dict)
+        and cleanup.get("status")
+        in ("ok", "invoked", "verified", "refused", "error", "unknown", "partial")
+    ):
+        facts["cleanup"] = _critical_outcome(cleanup, _include_cleanup=False)
+    return facts
+
+
+def _reduce_feedback(value, *, receipts=False):
+    """Discard optional observations before delivery and failure evidence."""
+    if isinstance(value, dict):
+        data = value.get("data")
+        if value.get("operation") == "play" and isinstance(data, dict) and "capture" in data:
+            # Capture metadata is an independent auxiliary observation. The MCP
+            # frame is handled separately; omit this component before discarding
+            # successful action delivery evidence just to retain sample arrays.
+            data.pop("capture")
+            data["capture_omitted"] = True
+        if isinstance(data, dict) and isinstance(data.get("results"), list) and "after" in data:
+            data.pop("after")
+            data["after_omitted"] = True
+        if value.get("status") in {
+            "ok",
+            "invoked",
+            "verified",
+            "refused",
+            "error",
+            "unknown",
+            "partial",
+        }:
+            if "input_context" in value:
+                value.pop("input_context")
+                value["input_context_omitted"] = True
+            if receipts and isinstance(value.get("receipt"), dict):
+                value["receipt"] = receipt_facts(value["receipt"])
+                value["receipt_details_omitted"] = True
+            cleanup = value.get("cleanup")
+            if (
+                receipts
+                and isinstance(cleanup, dict)
+                and cleanup.get("status")
+                in ("ok", "invoked", "verified", "refused", "error", "unknown", "partial")
+            ):
+                value["cleanup"] = _outcome_summary(cleanup, _include_cleanup=False)
+        for key, item in value.items():
+            if key not in {"target_binding", "root_binding", "selector_suggestion"}:
+                _reduce_feedback(item, receipts=receipts)
+    elif isinstance(value, list):
+        for item in value:
+            _reduce_feedback(item, receipts=receipts)
+
+
+def _cleanup_summaries(value):
+    found = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"receipt", "events", "input_context"}:
+                continue
+            if (
+                key == "cleanup"
+                and isinstance(item, dict)
+                and item.get("status")
+                in {"ok", "invoked", "verified", "refused", "error", "unknown", "partial"}
+            ):
+                found.append(_outcome_summary(item))
+            elif isinstance(item, (dict, list)):
+                found.extend(_cleanup_summaries(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_cleanup_summaries(item))
     return found
 
 
@@ -146,6 +349,8 @@ def _drop_identity_fields(value):
             "control_type",
             "token",
             "element_token",
+            "root_binding",
+            "process_creation_time",
         ):
             value.pop(key, None)
         for item in value.values():
@@ -160,13 +365,23 @@ def bound_result(value: dict, max_output_chars=DEFAULT_CHARS, max_output_bytes=D
     chars, byte_limit = validate_budget(max_output_chars, max_output_bytes)
     if not isinstance(value, dict):
         raise TypeError("Result must be a JSON object")
-    value = _guard_node_references(value)
+    value = _guard_receipts(_guard_node_references(value))
     if _fits(value, chars, byte_limit):
         return value
     saved_failures = _failure_summaries(value)
+    component_failures = _component_failure_summaries(value)
+    saved_cleanup = _cleanup_summaries(value)
     bounded = copy.deepcopy(value)
     bounded["output_truncated"] = True
     bounded["output_limits"] = {"max_chars": chars, "max_bytes": byte_limit}
+    if component_failures:
+        bounded["component_failure_summary"] = component_failures
+    _reduce_feedback(bounded)
+    if _fits(bounded, chars, byte_limit):
+        return bounded
+    _reduce_feedback(bounded, receipts=True)
+    if _fits(bounded, chars, byte_limit):
+        return bounded
     if saved_failures:
         bounded["failure_summary"] = saved_failures[0]
     # Shorten data strings before dropping evidence. Opaque tokens are never cut.
@@ -186,19 +401,7 @@ def bound_result(value: dict, max_output_chars=DEFAULT_CHARS, max_output_bytes=D
             action = item.get("result", {})
             if not isinstance(action, dict):
                 continue
-            summary = {
-                name: action[name]
-                for name in (
-                    "status",
-                    "operation",
-                    "method",
-                    "may_have_acted",
-                    "cancelled",
-                )
-                if name in action
-            }
-            if isinstance(action.get("error"), dict):
-                summary["error"] = {"code": action["error"].get("code", "ERROR")}
+            summary = _outcome_summary(action)
             summaries.append({"index": item.get("index"), "result": summary})
         failure_statuses = {"error", "refused", "unknown", "partial"}
         owner[key] = [
@@ -239,18 +442,31 @@ def bound_result(value: dict, max_output_chars=DEFAULT_CHARS, max_output_bytes=D
             "may_have_acted",
             "cancelled",
             "replayed",
+            "consumption_verified",
+            "release_unconfirmed",
         )
         if key in bounded
     }
     minimal["output_truncated"] = True
     minimal["data_omitted"] = True
     if isinstance(error, dict):
-        minimal["error"] = {
-            "code": str(error.get("code", "ERROR"))[:64],
-            "message": str(error.get("message", ""))[:128],
-        }
+        minimal["error"] = _error_summary(error)
+    if saved_cleanup:
+        minimal["cleanup"] = next(
+            (
+                item
+                for item in saved_cleanup
+                if item.get("status") in {"error", "unknown", "partial", "refused"}
+            ),
+            saved_cleanup[0],
+        )
+    if isinstance(bounded.get("receipt"), dict):
+        minimal["receipt"] = receipt_facts(bounded["receipt"])
     # Preserve aggregate counters when individual action records cannot fit.
     data = bounded.get("data")
+    if bounded.get("operation") == "play" and isinstance(data, dict):
+        actions = data.get("actions")
+        data = actions.get("data") if isinstance(actions, dict) else None
     if isinstance(data, dict):
         counters = {
             key: data[key]
@@ -260,16 +476,40 @@ def bound_result(value: dict, max_output_chars=DEFAULT_CHARS, max_output_bytes=D
                 "completed",
                 "stopped_early",
             )
-            if isinstance(data.get(key), (int, bool))
+            if type(data.get(key)) is (bool if key == "stopped_early" else int)
         }
         if counters:
             minimal["data"] = counters
     if saved_failures:
         minimal.setdefault("data", {})["first_failure"] = saved_failures[0]
+    if component_failures:
+        minimal["component_failure_summary"] = component_failures
     # Identity is indivisible: if the rich result can't fit, this summary omits
     # it entirely rather than returning a modified reusable Name/AutomationId.
     if not _fits(minimal, chars, byte_limit):
         _drop_identity_fields(minimal)
+    if not _fits(minimal, chars, byte_limit):
+        # Phase/event/timing detail is secondary, but accepted=null and explicit
+        # unknown totals are primary evidence, not optional receipt decoration.
+        if isinstance(minimal.get("receipt"), dict):
+            minimal["receipt"] = _receipt_core(minimal["receipt"])
+        first = minimal.get("data", {}).get("first_failure", {}).get("result", {})
+        if isinstance(first.get("receipt"), dict):
+            first["receipt"] = _receipt_core(first["receipt"])
+        cleanup = minimal.get("cleanup", {})
+        if isinstance(cleanup.get("receipt"), dict):
+            cleanup["receipt"] = _receipt_core(cleanup["receipt"])
+    if not _fits(minimal, chars, byte_limit):
+        if isinstance(minimal.get("cleanup"), dict):
+            minimal["cleanup"] = _critical_outcome(minimal["cleanup"])
+        failure = minimal.get("data", {}).get("first_failure")
+        if isinstance(failure, dict):
+            failure["result"] = _critical_outcome(failure["result"])
+            nested = failure["result"].get("cleanup")
+            if nested is not None and minimal.get("cleanup") == nested:
+                # The same release evidence already belongs to this action;
+                # don't pay for a second copy in the minimum public envelope.
+                minimal.pop("cleanup")
     if not _fits(minimal, chars, byte_limit):
         raise ValueError("Result envelope exceeds the configured output budget")
     return minimal

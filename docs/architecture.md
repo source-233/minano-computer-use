@@ -1,5 +1,14 @@
 # Architecture / implementation contract
 
+0.5 implementation contract: [v0.5.md](v0.5.md). Native actions report bounded
+dispatch receipts; optional detailed feedback is read-only and cannot delay
+owner-thread cleanup or rewrite mutation results. UIA membership failure details
+are captured at the failing predicate without provider text. Public
+process_creation_time is a decimal string/null; Win32, runtime, tokens,
+coordinates and worker IPC retain exact Python integers. Conversion occurs only
+at the public MCP/trace boundary before response budgeting. State can explicitly
+select an existing capture backend without changing foreground policy.
+
 0.4 adds a separate background-message executor and bound, non-atomic application
 state. See [v0.4.md](v0.4.md) for input selection, worker identity/cleanup, rich
 UIA discovery, redaction and per-component failure semantics. Native foreground

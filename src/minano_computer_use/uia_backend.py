@@ -19,9 +19,32 @@ from .output import bound_result, validate_budget
 
 
 class Refusal(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, *, details=None):
         super().__init__(message)
         self.code = code
+        self.details = details
+
+
+def _error_type(error):
+    # Provider-defined exception names can also contain private data. Expose only
+    # fixed, useful categories, never exception text or arbitrary class names.
+    name = type(error).__name__
+    return (
+        name
+        if name
+        in {
+            "COMError",
+            "OSError",
+            "RuntimeError",
+            "ValueError",
+            "TypeError",
+            "AttributeError",
+            "TimeoutError",
+            "PermissionError",
+            "ReferenceError",
+        }
+        else "ProviderError"
+    )
 
 
 class UIABackend:
@@ -82,6 +105,8 @@ class UIABackend:
                 output = self._execute(request, action)
         except (Refusal, default_win32.TargetError) as exc:
             output = result("refused", action, method="uia", code=exc.code, message=str(exc))
+            if isinstance(exc, Refusal) and exc.details is not None:
+                output["error"]["details"] = exc.details
         except Exception as exc:
             output = result(
                 "unknown" if self._may_have_acted else "error",
@@ -89,7 +114,7 @@ class UIABackend:
                 method="uia",
                 code="UIA_MUTATION_UNCERTAIN" if self._may_have_acted else "UIA_ERROR",
                 # Provider exceptions can contain entered/password values. Do not echo them.
-                message=f"{type(exc).__name__}: UIA provider operation failed",
+                message=f"{_error_type(exc)}: UIA provider operation failed",
                 may_have_acted=self._may_have_acted,
             )
         try:
@@ -108,7 +133,7 @@ class UIABackend:
             output["observations"] = {
                 "before": before,
                 "after": None,
-                "error": f"{type(exc).__name__}: Observation unavailable",
+                "error": f"{_error_type(exc)}: Observation unavailable",
             }
         output["delivery"] = "read_only" if action in READ_ACTIONS else "accessibility"
         output["fallbacks"] = []
@@ -153,7 +178,7 @@ class UIABackend:
     def _unavailable(error=None, reason="Provider property unavailable"):
         evidence = {"status": "unavailable", "reason": reason}
         if error is not None:
-            evidence["error_type"] = type(error).__name__
+            evidence["error_type"] = _error_type(error)
         return evidence
 
     @staticmethod
@@ -303,7 +328,22 @@ class UIABackend:
         nodes, truncated = self._walk(control, depth, maximum)
         return not truncated and not self._unsafe_text_nodes(nodes, truncated)
 
-    def _state_binding(self, request, window):
+    @staticmethod
+    def _membership_failure(predicate, error=None):
+        failure = {"predicate": predicate}
+        if error is not None:
+            failure["error_type"] = _error_type(error)
+        return failure
+
+    @staticmethod
+    def _refuse_membership(stage, node_index, failure):
+        raise Refusal(
+            "STALE_TARGET",
+            "UIA membership could not be established",
+            details={"stage": stage, "node_index": node_index, **failure},
+        )
+
+    def _state_binding(self, request, window, *, stage="initial_binding"):
         expected = request.get("target_binding")
         if (
             not isinstance(expected, dict)
@@ -313,26 +353,60 @@ class UIABackend:
             raise Refusal(
                 "INVALID_TARGET_BINDING", "state requires a complete parent target binding"
             )
-        actual = self._window_identity(window)
-        if actual.get("process_creation_time") is None or any(
-            actual.get(key) != expected.get(key) for key in expected
-        ):
-            raise Refusal(
-                "STALE_TARGET", "Resolved window does not match the parent target binding"
+        try:
+            actual = self._window_identity(window)
+        except Exception as exc:
+            self._refuse_membership(
+                stage, 0, self._membership_failure("binding_identity_unavailable", exc)
             )
+        if actual.get("process_creation_time") is None:
+            self._refuse_membership(
+                stage, 0, self._membership_failure("binding_identity_unavailable")
+            )
+        for key in expected:
+            if actual.get(key) != expected.get(key):
+                self._refuse_membership(
+                    stage, 0, self._membership_failure("binding_" + key + "_mismatch")
+                )
         return dict(expected)
 
     def _state_live_candidate(self, control, original_id, root, root_id, expected):
+        """Return only the first original check's failure; None means established.
+
+        Keep provider reads/short circuiting in their original order. In particular,
+        the live root HWND comparison remains stricter than the initial None check.
+        """
+        predicate = "provider_property_unavailable"
         try:
-            if self._runtime_id(root) != root_id or int(root.ProcessId) != expected["pid"]:
-                return False
-            if getattr(root, "NativeWindowHandle", expected["hwnd"]) != expected["hwnd"]:
-                return False
-            if (
-                self._runtime_id(control) != original_id
-                or int(control.ProcessId) != expected["pid"]
-            ):
-                return False
+            current_id = self._runtime_id(root)
+            if current_id != root_id:
+                return self._membership_failure(
+                    "root_runtime_id_unavailable"
+                    if current_id is None
+                    else "root_runtime_id_changed"
+                )
+            if int(root.ProcessId) != expected["pid"]:
+                return self._membership_failure("root_pid_mismatch")
+            root_hwnd = getattr(root, "NativeWindowHandle", expected["hwnd"])
+            if root_hwnd != expected["hwnd"]:
+                # uiautomation also maps COMError/None to zero; its cause is unknown.
+                return self._membership_failure(
+                    "root_hwnd_unavailable"
+                    if root_hwnd is None
+                    else "root_hwnd_zero_or_unavailable"
+                    if root_hwnd == 0
+                    else "root_hwnd_mismatch"
+                )
+            current_id = self._runtime_id(control)
+            if current_id != original_id:
+                return self._membership_failure(
+                    "candidate_runtime_id_unavailable"
+                    if current_id is None
+                    else "candidate_runtime_id_changed"
+                )
+            if int(control.ProcessId) != expected["pid"]:
+                return self._membership_failure("candidate_pid_mismatch")
+            predicate = "ancestry_unavailable"
             ancestor = control
             for _ in range(64):
                 ancestor_id = self._runtime_id(ancestor)
@@ -340,70 +414,95 @@ class UIABackend:
                     break
                 ancestor = ancestor.GetParentControl()
                 if ancestor is None:
-                    return False
+                    return self._membership_failure("ancestry_unavailable")
             else:
-                return False
+                return self._membership_failure("ancestry_limit")
+            predicate = "provider_property_unavailable"
             hwnd = getattr(control, "NativeWindowHandle", 0)
             if hwnd in (None, 0, expected["hwnd"]):
-                return True
+                return None
+            predicate = "native_membership_unavailable"
             checker = getattr(self.win32, "is_child_window", None)
             if checker is not None:
-                return bool(checker(expected["hwnd"], int(hwnd), expected["pid"]))
+                return (
+                    None
+                    if bool(checker(expected["hwnd"], int(hwnd), expected["pid"]))
+                    else self._membership_failure("candidate_hwnd_membership_mismatch")
+                )
             user32_factory = getattr(self.win32, "_user32", None)
             if user32_factory is None:
-                return False
+                return self._membership_failure("native_membership_unavailable")
             user32 = user32_factory()
             child_pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(child_pid))
+            child_thread = user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(child_pid))
+            if child_thread == 0:
+                return self._membership_failure("native_membership_unavailable")
             user32.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
             user32.IsChild.restype = wintypes.BOOL
-            return child_pid.value == expected["pid"] and bool(
+            member = child_pid.value == expected["pid"] and bool(
                 user32.IsChild(expected["hwnd"], int(hwnd))
             )
-        except Exception:
-            return False
+            return (
+                None if member else self._membership_failure("candidate_hwnd_membership_mismatch")
+            )
+        except Exception as exc:
+            return self._membership_failure(predicate, exc)
+
+    def _require_state_candidate(self, control, original_id, root, root_id, expected, stage, index):
+        failure = self._state_live_candidate(control, original_id, root, root_id, expected)
+        if failure is not None:
+            self._refuse_membership(stage, index, failure)
 
     def _state(self, request, window, root, depth, maximum):
         expected = self._state_binding(request, window)
-        if int(root.ProcessId) != expected["pid"]:
-            raise Refusal(
-                "STALE_TARGET", "UIA root process does not match the parent target binding"
-            )
+        self._require_root_pid(root, expected["pid"], "state_initial_root")
         try:
             root_hwnd = root.NativeWindowHandle
         except Exception:
             root_hwnd = None
         if root_hwnd not in (None, expected["hwnd"]):
-            raise Refusal("STALE_TARGET", "UIA root window handle does not match the bound window")
+            self._refuse_membership(
+                "state_initial_root",
+                0,
+                # The wrapper's zero can mean a swallowed provider read failure.
+                self._membership_failure(
+                    "root_hwnd_zero_or_unavailable" if root_hwnd == 0 else "root_hwnd_mismatch"
+                ),
+            )
         times = {}
         start = self._clock()
-        root_id = self._runtime_id(root)
+        root_id = self._state_runtime_id(root, "state_initial_root", 0)
         nodes, truncated = self._walk(root, depth, maximum)
         times["traversal"] = {"start": start, "end": self._clock()}
         if root_id is None:
-            raise Refusal("STALE_TARGET", "UIA root RuntimeId is unavailable")
-        original_ids = [self._runtime_id(node) for node, _, _ in nodes]
+            self._refuse_membership(
+                "state_initial_root", 0, self._membership_failure("root_runtime_id_unavailable")
+            )
+        original_ids = [
+            self._state_runtime_id(node, "traversal_identity", index)
+            for index, (node, _, _) in enumerate(nodes)
+        ]
         if any(node_id is None for node_id in original_ids):
-            raise Refusal("STALE_TARGET", "State traversal contains an unbound UIA element")
+            self._refuse_membership(
+                "traversal_identity",
+                original_ids.index(None),
+                self._membership_failure("candidate_runtime_id_unavailable"),
+            )
         unsafe_text = self._unsafe_text_nodes(nodes, truncated)
         focus_start = self._clock()
         focused = []
         for index, (control, _, _) in enumerate(nodes):
-            if not self._state_live_candidate(
-                control, original_ids[index], root, root_id, expected
-            ):
-                raise Refusal(
-                    "STALE_TARGET", "UIA element left the bound root during state collection"
-                )
+            self._require_state_candidate(
+                control, original_ids[index], root, root_id, expected, "focus_before_read", index
+            )
             try:
                 if control.HasKeyboardFocus is True:
                     focused.append(index)
             except Exception:
                 continue
-            if not self._state_live_candidate(
-                control, original_ids[index], root, root_id, expected
-            ):
-                raise Refusal("STALE_TARGET", "UIA focus candidate left the bound root")
+            self._require_state_candidate(
+                control, original_ids[index], root, root_id, expected, "focus_after_read", index
+            )
         if len(focused) == 1:
             focus = {"status": "available", "node_index": focused[0]}
         elif len(focused) > 1:
@@ -447,46 +546,62 @@ class UIABackend:
             if password is not False or index in unsafe_text:
                 selection = {"status": "redacted", "reason": "Password status true or unknown"}
             else:
-                if not self._state_live_candidate(
-                    control, original_ids[index], root, root_id, expected
-                ):
-                    raise Refusal("STALE_TARGET", "UIA selection candidate left the bound root")
+                self._require_state_candidate(
+                    control,
+                    original_ids[index],
+                    root,
+                    root_id,
+                    expected,
+                    "selection_before_pattern",
+                    index,
+                )
                 try:
                     pattern = self._pattern(control, "Text")
                     if pattern is None:
                         selection = {"status": "unavailable", "reason": "TextPattern unsupported"}
                     else:
-                        if not self._state_live_candidate(
-                            control, original_ids[index], root, root_id, expected
-                        ):
-                            raise Refusal(
-                                "STALE_TARGET", "UIA selection candidate changed before read"
-                            )
+                        self._require_state_candidate(
+                            control,
+                            original_ids[index],
+                            root,
+                            root_id,
+                            expected,
+                            "selection_before_read",
+                            index,
+                        )
                         ranges = pattern.GetSelection()
-                        if not self._state_live_candidate(
-                            control, original_ids[index], root, root_id, expected
-                        ):
-                            raise Refusal(
-                                "STALE_TARGET", "UIA selection candidate changed during read"
-                            )
+                        self._require_state_candidate(
+                            control,
+                            original_ids[index],
+                            root,
+                            root_id,
+                            expected,
+                            "selection_after_read",
+                            index,
+                        )
                         values, remaining = [], request.get("text_limit", 500)
                         for text_range in ranges[:16]:
                             if len(values) >= 16 or remaining <= 0:
                                 break
-                            if not self._state_live_candidate(
-                                control, original_ids[index], root, root_id, expected
-                            ):
-                                raise Refusal(
-                                    "STALE_TARGET", "UIA selection range left the bound root"
-                                )
+                            self._require_state_candidate(
+                                control,
+                                original_ids[index],
+                                root,
+                                root_id,
+                                expected,
+                                "text_before_read",
+                                index,
+                            )
                             text = str(text_range.GetText(remaining))
-                            if not self._state_live_candidate(
-                                control, original_ids[index], root, root_id, expected
-                            ):
-                                raise Refusal(
-                                    "STALE_TARGET",
-                                    "UIA selection candidate changed during text read",
-                                )
+                            self._require_state_candidate(
+                                control,
+                                original_ids[index],
+                                root,
+                                root_id,
+                                expected,
+                                "text_after_read",
+                                index,
+                            )
                             values.append(text[:remaining])
                             remaining -= len(values[-1])
                         selection = {
@@ -503,10 +618,9 @@ class UIABackend:
         rich = request.get("rich", True)
         values = []
         for index, (control, level, parent) in enumerate(nodes):
-            if not self._state_live_candidate(
-                control, original_ids[index], root, root_id, expected
-            ):
-                raise Refusal("STALE_TARGET", "UIA metadata candidate left the bound root")
+            self._require_state_candidate(
+                control, original_ids[index], root, root_id, expected, "metadata_before_read", index
+            )
             if rich:
                 entry = self._rich_metadata(
                     control,
@@ -519,14 +633,12 @@ class UIABackend:
             if index in unsafe_text:
                 entry["text_redacted"] = True
             values.append(entry)
-        if not all(
-            self._state_live_candidate(node, original_ids[index], root, root_id, expected)
-            for index, (node, _, _) in enumerate(nodes)
-        ):
-            raise Refusal("STALE_TARGET", "UIA element changed before state publication")
-        self._state_binding(request, window)
-        if int(root.ProcessId) != expected["pid"]:
-            raise Refusal("STALE_TARGET", "UIA root process changed during state collection")
+        for index, (node, _, _) in enumerate(nodes):
+            self._require_state_candidate(
+                node, original_ids[index], root, root_id, expected, "before_publication", index
+            )
+        self._state_binding(request, window, stage="binding_before_publication")
+        self._require_root_pid(root, expected["pid"], "root_before_publication")
         self._target_binding = {**expected}
         data = {
             "nodes": values,
@@ -540,6 +652,26 @@ class UIABackend:
             "consistency": "non_atomic",
         }
         return result("ok", "state", method="uia", data=data)
+
+    def _require_root_pid(self, root, pid, stage):
+        if root is None:
+            self._refuse_membership(stage, 0, self._membership_failure("root_unavailable"))
+        try:
+            actual_pid = int(root.ProcessId)
+        except Exception as exc:
+            self._refuse_membership(
+                stage, 0, self._membership_failure("provider_property_unavailable", exc)
+            )
+        if actual_pid != pid:
+            self._refuse_membership(stage, 0, self._membership_failure("root_pid_mismatch"))
+
+    def _state_runtime_id(self, control, stage, index):
+        try:
+            return self._runtime_id(control)
+        except Exception as exc:
+            self._refuse_membership(
+                stage, index, self._membership_failure("provider_property_unavailable", exc)
+            )
 
     @staticmethod
     def _runtime_id(control):
@@ -951,11 +1083,22 @@ class UIABackend:
         window = self.win32.resolve_window(request.get("target"))
         if action == "state":
             self._state_binding(request, window)
-        root = self.auto.ControlFromHandle(window["hwnd"])
+        try:
+            root = self.auto.ControlFromHandle(window["hwnd"])
+        except Exception as exc:
+            self._refuse_membership(
+                "initial_root", 0, self._membership_failure("root_unavailable", exc)
+            )
         # ProcessId is a read property, NOT a supported search keyword in uiautomation.
-        if root is None or int(root.ProcessId) != window["pid"]:
-            raise Refusal("STALE_TARGET", "UIA root does not belong to the resolved process")
-        self._bind(window, root, root)
+        self._require_root_pid(root, window["pid"], "initial_root")
+        try:
+            self._bind(window, root, root)
+        except Exception as exc:
+            self._refuse_membership(
+                "initial_root_binding",
+                0,
+                self._membership_failure("provider_property_unavailable", exc),
+            )
         if action == "find":
             if request.get("token") is not None:
                 raise Refusal("INVALID_QUERY", "find discovers using query/selector, not token")

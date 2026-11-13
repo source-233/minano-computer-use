@@ -19,6 +19,7 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from .contracts import STOP_STATUSES
 from .output import bound_result
 from .runtime import Runtime
+from .wire import public_result
 
 
 def _response(value, operation, max_output_chars=24000, max_output_bytes=65536):
@@ -29,7 +30,7 @@ def _response(value, operation, max_output_chars=24000, max_output_bytes=65536):
     elif "frame" in value:
         value = dict(value)
         frame = value.pop("frame")
-    value = bound_result(value, max_output_chars, max_output_bytes)
+    value = bound_result(public_result(value), max_output_chars, max_output_bytes)
     encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
     content = [TextContent(type="text", text=encoded)]
     if frame is not None:
@@ -157,9 +158,15 @@ def create_server(
         max_dim: int = 800,
         format: str = "jpeg",
         quality: int = 75,
+        capture_mode: str = "screen",
+        allow_fallback: bool = False,
         ctx: Context = None,
     ) -> CallToolResult:
-        """List/read windows or use semantic UIA patterns; never physically falls back."""
+        """List/read windows or use semantic UIA patterns; never physically falls back.
+
+        state accepts capture_mode/allow_fallback for its independent image component;
+        defaults remain screen/false. No focus activation; components are non-atomic.
+        """
         kwargs = dict(
             depth=depth,
             max_nodes=max_nodes,
@@ -186,6 +193,8 @@ def create_server(
                 max_dim=max_dim,
                 format=format,
                 quality=quality,
+                capture_mode=capture_mode,
+                allow_fallback=allow_fallback,
             )
         if action == "list":
             # Preserve the original default list API (no default 20-item truncation).
@@ -233,6 +242,7 @@ def create_server(
         focus: bool | str | None = None,
         key_method: str = "scancode",
         input_mode: str | None = None,
+        feedback: str = "compact",
         ctx: Context = None,
     ) -> CallToolResult:
         """Run ordered actions with uia, native, or background message input_mode.
@@ -245,6 +255,8 @@ def create_server(
         is automatically used before keyboard or mouse actions.
         Auto feedback returns full state for message, an image for native, text for UIA;
         screenshot=false disables feedback. Observation does not verify game effects.
+        feedback=compact/detailed controls native receipt/context metadata only,
+        independently of screenshot; it does not select another input channel.
         """
         return _response(
             await invoke(
@@ -263,6 +275,7 @@ def create_server(
                 focus=focus,
                 key_method=key_method,
                 input_mode=input_mode,
+                feedback=feedback,
                 scope=caller_scope(ctx),
             ),
             "act",
@@ -378,9 +391,14 @@ def create_server(
         format: str = "jpeg",
         quality: int = 75,
         input_mode: str | None = None,
+        feedback: str = "compact",
         ctx: Context = None,
     ) -> CallToolResult:
-        """Timed actions (at seconds) alongside capture; no strict frame/action pairing."""
+        """Timed actions (at seconds) alongside capture; no strict frame/action pairing.
+
+        feedback=compact/detailed controls native receipt/context metadata only;
+        it never changes input mode or recording behavior.
+        """
         return _response(
             await invoke(
                 owned.play,
@@ -400,6 +418,7 @@ def create_server(
                 capture_id=capture_id,
                 key_method=key_method,
                 input_mode=input_mode,
+                feedback=feedback,
                 allow_shell=allow_shell,
                 max_dim=max_dim,
                 format=format,

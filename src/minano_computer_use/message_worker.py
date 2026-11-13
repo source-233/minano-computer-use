@@ -74,6 +74,12 @@ class _Win32MessageAdapter:
     def identity(self, hwnd, pid):
         return win32.window_identity(hwnd, pid)
 
+    def window_snapshot(self, hwnd):
+        from .coordinates import window_snapshot
+
+        with self.physical_coordinates():
+            return window_snapshot(f"hwnd:{hwnd}")
+
     def observations(self):
         return win32.observations()
 
@@ -216,14 +222,20 @@ def worker_main(connection):
                 else:
                     # Never rediscover a title after the parent received its pin,
                     # including after a non-holding worker was discarded.
-                    backend._bindings[request["target"]] = request["binding"]
+                    if request.get("coordinate_binding") is None:
+                        backend._bindings[request["target"]] = request["binding"]
                     remaining = min(
                         request["timeout"], request["_deadline_monotonic"] - time.monotonic()
                     )
                     if remaining <= 0:
                         response = backend._response("refused", request["action"], code="TIMEOUT")
                     else:
-                        response = backend.execute(request["item"], request["target"], remaining)
+                        response = backend.execute(
+                            request["item"],
+                            request["target"],
+                            remaining,
+                            coordinate_binding=request.get("coordinate_binding"),
+                        )
                 response["_message_worker"] = True
                 response["_message_holds"] = bool(backend._keys or backend._buttons)
                 response["operation"] = request["action"]

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import ctypes
+import sys
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -12,6 +14,8 @@ from typing import Any
 
 from .contracts import result
 from .control import OperationCancelled
+from .coordinates import CoordinateError, StaleCaptureError, validate_window, window_snapshot
+from .input_context import read_input_context
 from .input_plan import EXTENDED_KEYS, key_code, normalize_native_action
 
 INPUT_MOUSE = 0
@@ -291,7 +295,13 @@ def _mouse(flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> _Input:
 
 
 class NativeInput:
-    def __init__(self, enabled: bool = False, adapter: Any = None, services: Any = None) -> None:
+    def __init__(
+        self,
+        enabled: bool = False,
+        adapter: Any = None,
+        services: Any = None,
+        input_context: Any = None,
+    ) -> None:
         self.enabled = enabled
         self._adapter = adapter
         self._held_keys: set[int] = set()
@@ -310,6 +320,172 @@ class NativeInput:
         self._action_acted = False
         self._clipboard_cleanup: dict | None = None
         self._coordinate_context_depth = 0
+        self._receipt: dict[str, Any] | None = None
+        self._receipt_started: float | None = None
+        self._receipt_last_event: float | None = None
+        self._receipt_privacy = False
+        self._target_binding: dict[str, Any] | None = None
+        self._last_cleanup: dict[str, Any] | None = None
+        self._input_context = input_context
+        self._receipt_methods: set[str] = set()
+        self._coordinate_binding: dict[str, Any] | None = None
+        self._coordinate_validator = None
+
+    def _begin_receipt(
+        self, *, requested_seconds: float | None = None, privacy: bool = False
+    ) -> None:
+        self._receipt_started = time.monotonic()
+        self._receipt_last_event = None
+        self._receipt_privacy = privacy
+        self._receipt_methods = set()
+        self._receipt = {
+            "requested_events": 0,
+            "accepted_events": 0,
+            "unknown_events": 0,
+            "phases": {
+                phase: {"requested": 0, "accepted": 0, "unknown": 0}
+                for phase in ("down", "up", "other")
+            },
+            "requested_seconds": requested_seconds,
+            "dispatch_interval_seconds": None,
+            "events": [],
+            "events_omitted": 0,
+            "consumption_verified": False,
+        }
+
+    @staticmethod
+    def _event_phase(event: _Input) -> str:
+        if event.type == INPUT_KEYBOARD:
+            return "up" if event.ki.dwFlags & KEYEVENTF_KEYUP else "down"
+        if event.type == INPUT_MOUSE:
+            if event.mi.dwFlags & (0x0004 | 0x0010 | 0x0040 | 0x0100):
+                return "up"
+            if event.mi.dwFlags & (0x0002 | 0x0008 | 0x0020 | 0x0080):
+                return "down"
+            return "other"
+        return "other"
+
+    def _receipt_event(
+        self,
+        *,
+        requested_vk: int | None,
+        w_vk: int,
+        w_scan: int,
+        flags: int,
+        phase: str,
+        accepted: bool | None,
+        recipient_hwnd: int | None = None,
+        recipient_pid: int | None = None,
+    ) -> None:
+        if self._receipt is None:
+            return
+        phase_data = self._receipt["phases"][phase]
+        self._receipt["requested_events"] += 1
+        phase_data["requested"] += 1
+        if accepted is True:
+            phase_data["accepted"] += 1
+        elif accepted is None:
+            phase_data["unknown"] += 1
+            self._receipt["unknown_events"] += 1
+        if accepted is True:
+            # accepted_events is deliberately corrected below if an unknown is seen.
+            self._receipt["accepted_events"] += 1
+        if self._receipt_privacy or len(self._receipt["events"]) >= 64:
+            self._receipt["events_omitted"] += 1
+        else:
+            self._receipt["events"].append(
+                {
+                    "requested_vk": requested_vk,
+                    "w_vk": int(w_vk),
+                    "w_scan": int(w_scan),
+                    "flags": int(flags),
+                    "phase": phase,
+                    "accepted": accepted,
+                }
+            )
+            if recipient_hwnd is not None:
+                self._receipt["events"][-1].update(
+                    recipient_hwnd=int(recipient_hwnd), recipient_pid=recipient_pid
+                )
+
+    def _dispatch_started(self) -> None:
+        if self._receipt is None:
+            return
+        now = time.monotonic()
+        if self._receipt_last_event is None:
+            self._receipt_started = now
+        else:
+            self._receipt["dispatch_interval_seconds"] = max(0.0, now - self._receipt_started)
+        self._receipt_last_event = now
+
+    def _record_send(self, events: list[_Input], accepted: int | None, requested_vks=None) -> None:
+        if self._receipt is None:
+            return
+        values = list(requested_vks or [])
+        for index, event in enumerate(events):
+            if accepted is None:
+                status = None
+            elif accepted < len(events) and index >= accepted:
+                # A short SendInput return confirms only its prefix; the
+                # unreturned suffix is not evidence of rejection.
+                status = None
+            else:
+                status = index < accepted
+            requested_vk = values[index] if index < len(values) else None
+            if (
+                requested_vk is None
+                and event.type == INPUT_KEYBOARD
+                and not (event.ki.dwFlags & KEYEVENTF_SCANCODE)
+            ):
+                requested_vk = int(event.ki.wVk)
+            if event.type == INPUT_KEYBOARD:
+                self._receipt_event(
+                    requested_vk=requested_vk,
+                    w_vk=int(event.ki.wVk),
+                    w_scan=int(event.ki.wScan),
+                    flags=int(event.ki.dwFlags),
+                    phase=self._event_phase(event),
+                    accepted=status,
+                )
+            else:
+                self._receipt_event(
+                    requested_vk=None,
+                    w_vk=0,
+                    w_scan=0,
+                    flags=int(event.mi.dwFlags),
+                    phase=self._event_phase(event),
+                    accepted=status,
+                )
+
+    def _record_post(
+        self,
+        *,
+        recipient_hwnd: int,
+        recipient_pid: int,
+        requested_vk: int | None,
+        w_scan: int,
+        flags: int,
+        phase: str,
+        accepted: bool | None,
+    ) -> None:
+        self._receipt_event(
+            requested_vk=requested_vk,
+            w_vk=requested_vk if requested_vk is not None else 0,
+            w_scan=w_scan,
+            flags=flags,
+            phase=phase,
+            accepted=accepted,
+            recipient_hwnd=recipient_hwnd,
+            recipient_pid=recipient_pid,
+        )
+
+    def _finish_receipt(self) -> dict[str, Any] | None:
+        if self._receipt is None:
+            return None
+        value = dict(self._receipt)
+        if value["unknown_events"]:
+            value["accepted_events"] = None
+        return value
 
     @property
     def _held_mouse(self) -> bool:
@@ -344,19 +520,51 @@ class NativeInput:
             if isinstance(resolved, dict):
                 rect = resolved.get("rect")
                 self._target_rect = tuple(rect) if rect else None
-                return dict(resolved)
+                info = dict(resolved)
+                self._bind_target(info)
+                return info
             self._target_rect = None
-            return {"hwnd": int(resolved)}
+            info = {"hwnd": int(resolved)}
+            self._bind_target(info)
+            return info
         from . import win32
 
         resolved = win32.resolve_window(target)
         self._target_rect = tuple(resolved["rect"])
-        return dict(resolved)
+        info = dict(resolved)
+        self._bind_target(info)
+        return info
+
+    def _bind_target(self, info: dict[str, Any]) -> None:
+        """Keep the resolved pin; auxiliary identity lookup never gates input."""
+        hwnd = int(info["hwnd"])
+        self._target_binding = {
+            "hwnd": hwnd,
+            "pid": info.get("pid"),
+            "process_creation_time": info.get("process_creation_time"),
+        }
+        try:
+            adapter = self._win()
+            if self._target_binding["pid"] is None and hasattr(adapter, "window_pid"):
+                self._target_binding["pid"] = adapter.window_pid(hwnd)
+            pid = self._target_binding["pid"]
+            if self._target_binding["process_creation_time"] is None and pid:
+                if hasattr(adapter, "process_creation_time"):
+                    self._target_binding["process_creation_time"] = adapter.process_creation_time(
+                        pid
+                    )
+                elif isinstance(adapter, _Win32Adapter):
+                    from .win32 import process_creation_time
+
+                    self._target_binding["process_creation_time"] = process_creation_time(pid)
+        except Exception:
+            pass
 
     def _target_hwnd(self, target: str) -> int:
         return int(self._target_info(target)["hwnd"])
 
     def _force_target_live(self, hwnd: int, expected_pid: int | None) -> bool:
+        self._coordinate_checkpoint(hwnd)
         adapter = self._win()
         return bool(
             hwnd > 0
@@ -408,6 +616,7 @@ class NativeInput:
         if expected_pid is None:
             expected_pid = adapter.window_pid(hwnd)
         binding = {"hwnd": hwnd, "pid": expected_pid}
+        self._target_binding["pid"] = expected_pid
         if not self._force_target_live(hwnd, expected_pid):
             return outcome(
                 "refused", "STALE_TARGET", "Target window disappeared or changed process"
@@ -502,16 +711,23 @@ class NativeInput:
             )
         return outcome("verified", foreground=True)
 
-    def _send(self, events: list[_Input]) -> None:
+    def _send(self, events: list[_Input], *, requested_vks=None) -> None:
         if not events:
             return
         # Even a failed SendInput/adapter call can have taken effect.
         self._action_acted = True
+        self._receipt_methods.add("SendInput")
+        captured = [_Input.from_buffer_copy(event) for event in events]
+        sent = None
         try:
+            self._dispatch_started()
             sent = self._win().send(events)
+            self._record_send(captured, sent, requested_vks)
             if sent != len(events):
                 raise RuntimeError(f"SendInput accepted {sent} of {len(events)} input events")
         except Exception:
+            if sent is None:
+                self._record_send(captured, None, requested_vks)
             if any(
                 event.type == INPUT_KEYBOARD
                 and event.ki.dwFlags & KEYEVENTF_KEYUP
@@ -558,11 +774,26 @@ class NativeInput:
 
     def _checkpoint(self, hwnd: int) -> None:
         self._cancel_checkpoint()
+        self._coordinate_checkpoint(hwnd)
         if self._win().foreground() != hwnd:
             raise PermissionError("target is no longer the foreground window")
         if self._expected_pid is not None:
             if self._win().window_pid(hwnd) != self._expected_pid:
                 raise PermissionError("target window changed process")
+
+    def _coordinate_checkpoint(self, hwnd: int) -> None:
+        binding = self._coordinate_binding
+        if binding is None:
+            return
+        if hwnd != binding.get("hwnd"):
+            raise StaleCaptureError("input recipient does not match captured window HWND")
+        if self._coordinate_validator is not None:
+            self._coordinate_validator(binding, hwnd)
+        else:
+            try:
+                validate_window(binding, window_snapshot(f"hwnd:{hwnd}"))
+            except CoordinateError as exc:
+                raise StaleCaptureError(str(exc)) from exc
 
     def _wait_checked(self, hwnd: int, seconds: float) -> None:
         """Wait on the owner thread, checking cancellation and focus throughout."""
@@ -608,7 +839,7 @@ class NativeInput:
         event = _key_event(self._win(), key)
         # Track the requested VK, not wVk: scan-code events set wVk to zero.
         self._held_keys.add(key)
-        self._send([event])
+        self._send([event], requested_vks=[key])
 
     def _post_key(self, root: int, child: int, pid: int, key: int, up=False, cleanup=False):
         adapter = self._win()
@@ -621,7 +852,23 @@ class NativeInput:
         if up:
             lparam |= (1 << 30) | (1 << 31)
         self._action_acted = True
-        if not adapter.post_message(child, 0x101 if up else 0x100, key, lparam):
+        self._receipt_methods.add("PostMessage")
+        accepted = None
+        try:
+            self._dispatch_started()
+            accepted = bool(adapter.post_message(child, 0x101 if up else 0x100, key, lparam))
+        finally:
+            self._record_post(
+                recipient_hwnd=child,
+                recipient_pid=pid,
+                requested_vk=key,
+                w_scan=scan,
+                flags=(KEYEVENTF_KEYUP if up else 0)
+                | (KEYEVENTF_EXTENDEDKEY if key in EXTENDED_KEYS else 0),
+                phase="up" if up else "down",
+                accepted=accepted,
+            )
+        if not accepted:
             if up:
                 self._cleanup_required = True
             raise RuntimeError("PostMessage rejected keyboard event")
@@ -634,7 +881,7 @@ class NativeInput:
         elif key in self._held_keys:
             if not cleanup:
                 self._checkpoint(hwnd)
-            self._send([_key_event(self._win(), key, True)])
+            self._send([_key_event(self._win(), key, True)], requested_vks=[key])
             self._held_keys.discard(key)
 
     def _choose_message_target(self, info: dict, key_method: str) -> None:
@@ -661,18 +908,21 @@ class NativeInput:
     def _chord(self, hwnd: int, keys: list[int], seconds: float = 0) -> None:
         if any(key in self._held_keys or key in self._message_keys for key in keys):
             raise ValueError("key is already held by this backend")
+        completed = False
         try:
             for key in keys:
                 self._press_key(hwnd, key)
             if seconds:
                 self._wait_checked(hwnd, seconds)
+            completed = True
         finally:
             failures = []
-            for key in reversed(keys):
-                try:
-                    self._release_key(hwnd, key, cleanup=True)
-                except Exception as exc:
-                    failures.append(str(exc))
+            with self._cleanup_receipt() if not completed else nullcontext():
+                for key in reversed(keys):
+                    try:
+                        self._release_key(hwnd, key, cleanup=True)
+                    except Exception:
+                        failures.append("key release failed")
             if failures:
                 self._cleanup_required = True
                 raise RuntimeError("key release failed")
@@ -719,7 +969,82 @@ class NativeInput:
             finally:
                 self._coordinate_context_depth -= 1
 
-    def execute(self, action: dict, target: str, key_method: str = "scancode") -> dict:
+    def execute(
+        self,
+        action: dict,
+        target: str,
+        key_method: str = "scancode",
+        *,
+        feedback: str = "compact",
+        coordinate_binding: dict[str, Any] | None = None,
+        coordinate_validator=None,
+    ) -> dict:
+        """Attach bounded factual metadata without replaying the action."""
+        if feedback not in {"compact", "detailed"}:
+            return result("refused", "", code="INVALID_ACTION", message="Invalid feedback")
+        privacy = isinstance(action, dict) and action.get("action", action.get("type")) in {
+            "text",
+            "type",
+            "paste",
+        }
+        self._target_binding = None
+        self._last_cleanup = None
+        self._coordinate_binding = copy.deepcopy(coordinate_binding)
+        self._coordinate_validator = coordinate_validator
+        if coordinate_binding is not None:
+            target = f"hwnd:{coordinate_binding['hwnd']}"
+        self._begin_receipt(privacy=privacy)
+        try:
+            response = self._execute_coordinates(action, target, key_method)
+            if self._last_cleanup is not None:
+                response["cleanup"] = self._last_cleanup
+            if privacy and "error" in response:
+                response["error"]["message"] = "Text input failed"
+            if self._target_binding is not None:
+                response["target_binding"] = dict(self._target_binding)
+            response["receipt"] = self._finish_receipt()
+            if self._receipt_methods:
+                response["method"] = "+".join(sorted(self._receipt_methods))
+            if feedback == "detailed":
+                if self._target_binding is None:
+                    response["input_context"] = {
+                        "status": "unknown",
+                        "non_atomic": True,
+                        "reason": "target_unresolved",
+                    }
+                elif self._cancel_event is not None and self._cancel_event.is_set():
+                    response["input_context"] = {
+                        "status": "unknown",
+                        "non_atomic": True,
+                        "reason": "cancelled",
+                    }
+                elif (
+                    self._held_keys
+                    or self._held_buttons
+                    or self._message_keys
+                    or self._held_unicode
+                ):
+                    # Runtime batch-final release has priority over optional observation.
+                    response["input_context"] = {
+                        "status": "unknown",
+                        "non_atomic": True,
+                        "reason": "owned_input_pending",
+                    }
+                else:
+                    response["input_context"] = read_input_context(
+                        self._win(),
+                        self._target_binding,
+                        source=self._input_context,
+                        cancel_event=self._cancel_event,
+                    )
+            return response
+        finally:
+            self._receipt = None
+            self._target_binding = None
+            self._coordinate_binding = None
+            self._coordinate_validator = None
+
+    def _execute_coordinates(self, action: dict, target: str, key_method: str = "scancode") -> dict:
         """Resolve, inject and clean up under owner-thread physical DPI mapping."""
         if (
             not isinstance(action, dict)
@@ -742,7 +1067,7 @@ class NativeInput:
         except _PhysicalCoordinatesError as exc:
             acted = self._action_acted
             # Releases carry no positions and must not depend on DPI setup.
-            cleanup = self._release_all()
+            cleanup = self.release_all()
             response = result(
                 "unknown" if acted else "refused",
                 str(action.get("action", "")),
@@ -817,6 +1142,8 @@ class NativeInput:
         try:
             action = normalize_native_action(action)
             name = action["action"]
+            if self._receipt is not None:
+                self._receipt["requested_seconds"] = action.get("seconds")
             if not isinstance(key_method, str) or key_method not in {"scancode", "auto", "message"}:
                 raise ValueError("key_method must be auto, scancode or message")
         except ValueError as exc:
@@ -832,6 +1159,8 @@ class NativeInput:
             try:
                 info = self._target_info(target)
                 hwnd = int(info["hwnd"])
+                if self._coordinate_binding is not None:
+                    self._coordinate_checkpoint(hwnd)
                 if hasattr(self._win(), "window_pid"):
                     actual_pid = self._win().window_pid(hwnd)
                     self._expected_pid = info.get("pid", actual_pid)
@@ -848,12 +1177,19 @@ class NativeInput:
                     or self._held_unicode
                 ):
                     self.release_all()
-                return result("refused", name, code="FOREGROUND", message=str(exc))
+                return result(
+                    "refused",
+                    name,
+                    code=getattr(exc, "code", "FOREGROUND"),
+                    message=str(exc),
+                    may_have_acted=False,
+                )
         try:
             if name == "focus":
                 self._cancel_checkpoint()
                 info = self._target_info(target)
                 hwnd = int(info["hwnd"])
+                self._coordinate_checkpoint(hwnd)
                 if hasattr(self._win(), "window_pid"):
                     pid = self._win().window_pid(hwnd)
                     if not pid or info.get("pid", pid) != pid:
@@ -870,6 +1206,8 @@ class NativeInput:
                 )
             if name == "force_focus":
                 self._cancel_checkpoint()
+                if self._coordinate_binding is not None:
+                    self._coordinate_checkpoint(self._coordinate_binding["hwnd"])
                 return self._force_focus(name, target)
             if name in {"key", "hold"}:
                 keycodes = action["key"]
@@ -949,7 +1287,22 @@ class NativeInput:
                             ):
                                 raise PermissionError("message target disappeared")
                             self._action_acted = True
-                            if not self._win().post_message(child, 0x102, unit, 1):
+                            accepted = None
+                            try:
+                                self._receipt_methods.add("PostMessage")
+                                self._dispatch_started()
+                                accepted = bool(self._win().post_message(child, 0x102, unit, 1))
+                            finally:
+                                self._record_post(
+                                    recipient_hwnd=child,
+                                    recipient_pid=pid,
+                                    requested_vk=None,
+                                    w_scan=0,
+                                    flags=0,
+                                    phase="other",
+                                    accepted=accepted,
+                                )
+                            if not accepted:
                                 raise RuntimeError("PostMessage rejected character")
                             continue
                         self._held_unicode.append(unit)
@@ -959,11 +1312,12 @@ class NativeInput:
                         except Exception as exc:
                             input_error = exc
                         finally:
-                            try:
-                                self._send([_unicode(chr(unit), True)])
-                                self._held_unicode.remove(unit)
-                            except Exception as exc:
-                                input_error = input_error or exc
+                            with self._cleanup_receipt() if input_error else nullcontext():
+                                try:
+                                    self._send([_unicode(chr(unit), True)])
+                                    self._held_unicode.remove(unit)
+                                except Exception as exc:
+                                    input_error = input_error or exc
                         if input_error is not None:
                             raise RuntimeError(f"Unicode input/release failed: {input_error}")
                 return result(
@@ -1000,8 +1354,9 @@ class NativeInput:
                             self._wait_checked(hwnd, _CLICK_PRESS_SECONDS)
                             self._send_checked(hwnd, [self._button_event(button, True)])
                     finally:
-                        for key in reversed(modifiers):
-                            self._release_key(hwnd, key, cleanup=True)
+                        with self._cleanup_receipt() if sys.exception() else nullcontext():
+                            for key in reversed(modifiers):
+                                self._release_key(hwnd, key, cleanup=True)
                 return result(
                     "invoked", name, method="SetCursorPos" if name == "move" else "SendInput"
                 )
@@ -1050,8 +1405,9 @@ class NativeInput:
                     self._send_checked(hwnd, [self._button_event(button, True)])
                 finally:
                     if button in self._held_buttons:
-                        self._send([self._button_event(button, True)])
-                        self._held_buttons.discard(button)
+                        with self._cleanup_receipt():
+                            self._send([self._button_event(button, True)])
+                            self._held_buttons.discard(button)
             elif name == "look":
                 if "dx" not in action or "dy" not in action:
                     return result(
@@ -1106,7 +1462,7 @@ class NativeInput:
             return result(
                 "unknown" if self._action_acted else "refused",
                 name,
-                code="INVALID_ACTION",
+                code=getattr(exc, "code", "INVALID_ACTION"),
                 message="Clipboard paste failed" if name == "paste" else str(exc),
                 may_have_acted=self._action_acted,
             )
@@ -1130,6 +1486,100 @@ class NativeInput:
             )
 
     def release_all(self) -> dict:
+        """Give every cleanup its own ledger, including runtime batch-final cleanup."""
+        previous = (
+            self._receipt,
+            self._receipt_started,
+            self._receipt_last_event,
+            self._receipt_privacy,
+            self._receipt_methods,
+        )
+        self._begin_receipt(privacy=True)
+        try:
+            response = self._release_coordinates()
+            response["receipt"] = self._finish_receipt()
+            if self._receipt_methods:
+                response["method"] = "+".join(sorted(self._receipt_methods))
+            else:
+                # A legacy release_all default is not evidence of an API call.
+                response.pop("method", None)
+            if previous[0] is not None:
+                self._retain_cleanup(response)
+            return response
+        finally:
+            (
+                self._receipt,
+                self._receipt_started,
+                self._receipt_last_event,
+                self._receipt_privacy,
+                self._receipt_methods,
+            ) = previous
+
+    def _retain_cleanup(self, response: dict) -> None:
+        """Keep failed-attempt evidence when existing cleanup semantics retry ups."""
+        if self._last_cleanup is None:
+            self._last_cleanup = response
+            return
+        earlier = self._last_cleanup["receipt"]
+        current = response["receipt"]
+        methods = set()
+        for cleanup in (self._last_cleanup, response):
+            if cleanup["receipt"]["requested_events"] and cleanup.get("method"):
+                methods.update(cleanup["method"].split("+"))
+        if methods:
+            response["method"] = "+".join(sorted(methods))
+        else:
+            response.pop("method", None)
+        for name in ("requested_events", "unknown_events", "events_omitted"):
+            current[name] += earlier[name]
+        for phase in ("down", "up", "other"):
+            for name in ("requested", "accepted", "unknown"):
+                current["phases"][phase][name] += earlier["phases"][phase][name]
+        current["accepted_events"] = (
+            None
+            if current["unknown_events"]
+            else sum(phase["accepted"] for phase in current["phases"].values())
+        )
+        current["dispatch_interval_seconds"] = None  # separate cleanup intervals
+        self._last_cleanup = response
+
+    @contextmanager
+    def _cleanup_receipt(self):
+        """Isolate finally releases without performing any additional releases."""
+        previous = (
+            self._receipt,
+            self._receipt_started,
+            self._receipt_last_event,
+            self._receipt_privacy,
+            self._receipt_methods,
+        )
+        self._begin_receipt(privacy=True)
+        try:
+            yield
+        finally:
+            receipt = self._finish_receipt()
+            self._retain_cleanup(
+                result(
+                    "unknown"
+                    if receipt["accepted_events"] != receipt["requested_events"]
+                    else "invoked",
+                    "finally_release",
+                    method=(
+                        "+".join(sorted(self._receipt_methods)) if self._receipt_methods else None
+                    ),
+                    receipt=receipt,
+                    consumption_verified=False,
+                )
+            )
+            (
+                self._receipt,
+                self._receipt_started,
+                self._receipt_last_event,
+                self._receipt_privacy,
+                self._receipt_methods,
+            ) = previous
+
+    def _release_coordinates(self) -> dict:
         if not (
             self._held_keys or self._held_unicode or self._held_mouse or self._message_keys
         ) or (self._owner_thread_id is not None and self._owner_thread_id != threading.get_ident()):
@@ -1171,25 +1621,25 @@ class NativeInput:
                 failures.append("message key release failed")
         for key in sorted(self._held_keys):
             try:
-                self._send([_key_event(self._win(), key, True)])
+                self._send([_key_event(self._win(), key, True)], requested_vks=[key])
                 self._held_keys.discard(key)
                 released += 1
-            except Exception as exc:
-                failures.append(str(exc))
+            except Exception:
+                failures.append("key release failed")
         for unit in list(self._held_unicode):
             try:
                 self._send([_unicode(chr(unit), True)])
                 self._held_unicode.remove(unit)
                 released += 1
-            except Exception as exc:
-                failures.append(str(exc))
+            except Exception:
+                failures.append("Unicode release failed")
         for button in sorted(self._held_buttons):
             try:
                 self._send([self._button_event(button, True)])
                 self._held_buttons.discard(button)
                 released += 1
-            except Exception as exc:
-                failures.append(str(exc))
+            except Exception:
+                failures.append("button release failed")
         if self._held_keys or self._held_unicode or self._held_mouse or self._message_keys:
             self._cleanup_required = True
             return result(

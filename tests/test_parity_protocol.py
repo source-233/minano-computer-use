@@ -26,7 +26,17 @@ class Native:
     def set_cancel_event(self, event):
         self.event = event
 
-    def execute(self, action, target, key_method="scancode"):
+    def execute(
+        self,
+        action,
+        target,
+        key_method="scancode",
+        *,
+        coordinate_binding=None,
+        coordinate_validator=None,
+    ):
+        if coordinate_binding is not None:
+            coordinate_validator(coordinate_binding, int(target[5:]))
         self.calls.append((action, target, key_method))
         return {"status": "invoked", "operation": action["action"]}
 
@@ -1021,7 +1031,13 @@ def test_protocol_uia_auto_text_is_bounded_without_image(tmp_path):
     class Readback(Broker):
         def call(self, request, timeout=None, cancel_event=None):
             self.calls.append(request)
-            return {"status": "ok", "data": {"nodes": [{"text": "readback" * 5000}]}}
+            if request["action"] == "text":
+                return {"status": "ok", "data": {"nodes": [{"text": "readback" * 5000}]}}
+            return {
+                "status": "invoked",
+                "operation": request["action"],
+                "data": {"pattern_returned": True},
+            }
 
     async def exercise():
         broker, camera = Readback(), Camera()

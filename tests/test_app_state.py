@@ -45,6 +45,11 @@ def test_state_refuses_missing_or_stale_binding_before_traversal():
     service.close()
     assert missing["error"]["code"] == "INVALID_TARGET_BINDING"
     assert stale["error"]["code"] == "STALE_TARGET"
+    assert stale["error"]["details"] == {
+        "stage": "initial_binding",
+        "node_index": 0,
+        "predicate": "binding_process_creation_time_mismatch",
+    }
 
 
 def test_state_password_and_unknown_password_suppress_selection_and_text():
@@ -120,6 +125,11 @@ def test_state_rejects_dynamically_stale_window_after_reads():
     service.close()
     assert response["status"] == "refused"
     assert response["error"]["code"] == "STALE_TARGET"
+    assert response["error"]["details"] == {
+        "stage": "binding_before_publication",
+        "node_index": 0,
+        "predicate": "binding_process_creation_time_mismatch",
+    }
     assert "data" not in response
 
 
@@ -227,6 +237,17 @@ def test_state_rejects_candidate_detaching_during_provider_reads(stage):
     service.close()
     assert response["status"] == "refused"
     assert response["error"]["code"] == "STALE_TARGET"
+    assert response["error"]["message"] == "UIA membership could not be established"
+    assert response["error"]["details"] == {
+        "stage": {
+            "focus": "focus_after_read",
+            "selection": "selection_after_read",
+            "text": "text_after_read",
+            "metadata": "before_publication",
+        }[stage],
+        "node_index": 1,
+        "predicate": "ancestry_unavailable",
+    }
     assert "OTHER_ROOT" not in str(response)
     assert "data" not in response
 
@@ -243,4 +264,9 @@ def test_state_rejects_foreign_hwnd_even_if_provider_keeps_original_parent():
     )
     service.close()
     assert response["error"]["code"] == "STALE_TARGET"
+    assert response["error"]["details"] == {
+        "stage": "focus_before_read",
+        "node_index": 1,
+        "predicate": "candidate_hwnd_membership_mismatch",
+    }
     assert "data" not in response

@@ -1,5 +1,194 @@
 # Verification evidence and limits
 
+## 0.5 feedback and wire fidelity — verified source, not globally installed
+
+### Final additional-review gate — 1112 tests, 2026-11-13
+
+The additional review confirmed and fixed five issues: omitted component failure
+evidence under tight budgets; unverified process-lifetime/thread identity in
+input context; misleading requested-versus-actual message release evidence;
+ambiguous GetAsyncKeyState zero reported as certainly released; and image-derived
+actions re-resolving a reused window title after earlier batch effects.
+
+The P1 image-binding fix retains an immutable validated capture/recipient pin
+through native and message execution. Per-action and normal event checkpoints
+revalidate HWND/PID/process creation, geometry and DPI. Cleanup remains exempt
+from coordinate geometry but keeps its existing owner/identity requirements.
+Injected backends that cannot explicitly enforce the pin refuse image actions.
+
+An independent fake replay of the original P1 scenario now completes only the
+first key action and refuses the later click with STALE_CAPTURE: zero cursor
+moves and zero mouse events. This is bounded checkpoint validation, not an atomic
+guarantee against OS changes between a check and a subsequent input API call.
+
+| Command | Result |
+|---|---|
+| `uv run --no-sync ruff check .` | exit 0 |
+| `uv run --no-sync ruff format --check .` | exit 0; 93 files formatted |
+| `uv run --no-sync pytest -q -o faulthandler_timeout=30` | exit 0; **1112 passed in 40.87s** |
+| `uv run --no-sync python scripts/smoke_stdio.py` | exit 0; seven tools and v0.5 schema |
+| `uv run --no-sync python scripts/verify_feedback.py` | exit 0; six Python IPC/MCP/JS fidelity checks |
+| `uv run --no-sync python scripts/verify_windows.py` | exit 0; ten owned UIA/PrintWindow/context checks |
+| `uv run --no-sync python scripts/verify_playback.py` | exit 0; synthetic PyAV decode and frame exports |
+| `uv lock --check --offline` | exit 0 |
+| `uv build` | exit 0; 0.5.0 wheel and source distribution |
+
+The image-binding/coordinates/runtime/native/parity/message focused suite passed
+340 tests in4.27s before the final gate. The public budget tests retain sanitized
+state component errors, actual recipient HWND/PID are separated from requested
+target bindings in event details, and unavailable modifier samples remain null.
+
+An attempted `scripts/verify_background.py` rerun exited1 before any test action:
+the cursor moved during fixture launch. The fixture exited0 and all owned windows
+were reclaimed, but the report correctly has passed=false. No cursor restoration
+or automatic rerun was attempted. The previous 19-check pass predates these
+changes and is historical evidence, not a fresh passing integration result.
+
+All26 wheel Python modules matched final source byte-for-byte. Global MCP config
+and installed-executable hashes were unchanged; 0.4 remains installed. Existing
+index contents were preserved; this review did not stage, commit, push or install.
+No game/native-input/IME experiment was added during this review. The separately
+authorized chat-input comparison below does not prove the FH6 historical cause.
+
+### Additional review findings (after the original 1036-test gate)
+
+The subsequent review identified further cases absent from the first gate: minimal
+state output could erase component failure codes; input context did not verify
+the target's creation time/thread before certifying consistency; held message
+keyup feedback could describe the request target/method rather than its pinned
+actual recipient; GetAsyncKeyState zero was treated as certainly released even
+though the API also returns zero on unavailable access. Narrow fixes and fake
+regressions were added without desktop input. Modifiers now use bool/null, with
+partial/unknown availability instead of falsely known all-up states.
+
+A separate P1 pre-existing issue was reproduced with production native input and
+fake windows: image coordinates were validated during whole-plan preparation,
+but a later action could re-resolve a reused title and click another window. The
+fix now carries the original capture/recipient pin through native and message
+dispatch, and refuses changes to identity/geometry/DPI before action checkpoints.
+Regression evidence appears in the final gate below; it does not establish
+historical application consumption or eliminate the OS check-to-use interval.
+
+The current contract is [v0.5.md](v0.5.md). The release adds bounded native
+dispatch receipts, optional read-only input context, truthful UIA failure
+predicates, exact public timestamp strings, runtime-instance facts and explicit
+state capture selection. These do not establish the cause of the historical
+Edge or FH6 failures. No new game input, IME switch, remote-software setting
+change or global installation is part of this implementation run.
+
+`scripts/verify_feedback.py` uses an isolated synthetic MCP server with a known
+64-bit creation time, then reads the real stdio response in Python and passes
+both public representations through JavaScript. It checks exact string/null
+types and round-trip fidelity; it never queries a real window or sends input.
+`scripts/verify_windows.py` additionally requests bound combined state through
+the explicit PrintWindow backend on its owned fixture, without native input.
+Implementation lanes were frozen and their artifacts reconciled before the
+merged final gate below. Older-release results are historical and do not
+substitute for the 0.5 evidence.
+
+Completed scoped checks before the merged gate (not a substitute for it):
+- UIA state/diagnostics: 71 tests; existing UIA/query regressions: 59 tests. The
+  review also corrected zero thread-ID lookup to unavailable and root HWND zero
+  to zero-or-unavailable, without weakening refusals or repeating queries.
+- Runtime/protocol/output/trace/wire: 196 tests, including Bun round-trip; after
+  the new static predicate was added, 52 relevant output/protocol tests passed.
+- Real stdio schema/status smoke passed for version0.5.0, compact feedback,
+  explicit state backend defaults and stable per-process instance facts.
+- Synthetic stdio/broker/JavaScript verification passed six checks: exact
+  internal Python IPC integer, exact external decimal string, nested identities,
+  null, unchanged HWND/PID number types, and matching text/structured results.
+- Owned Win32 fixture passed nine checks, including actual bound UIA plus
+  explicit PrintWindow state. Fixture exit0, no native input. Report:
+  `.artifacts/windows-smoke.json`.
+- Existing synthetic PyAV playback passed: ten decoded video frames, three
+  exported original PNGs and JPEG800x343 montage. No user game was recorded.
+- Scoped budget reviews found that the 2048-character/byte fallback
+  could omit a failed action's receipt and play's nested action counters. The
+  repair retains core requested/accepted/unknown counts (including null accepted),
+  the first failure, cleanup uncertainty and nested play counters. Actual MCP
+  envelope regressions passed in 54 focused output/protocol tests; an independent
+  in-memory act/play reproduction confirmed the repaired behavior. This is scoped
+  evidence only; the merged native implementation and full-suite gate remain
+  pending.
+
+The first merged suite checkpoint reported 1027 passed / 1 failed. The failing
+legacy UIA auto-readback fixture returned huge text even for invoke; it was
+corrected to emit a realistic small invoke result and oversized text only for
+the text read. The targeted regression then passed. This does not weaken the
+new primary-evidence-before-auxiliary budget policy.
+
+The owned-window script now also directly calls the read-only input-context
+observer. Ten checks passed with fixture exit0 and no native input: target-thread
+layout was observable and cross-process IME open/conversion remained explicitly
+unknown. This is not a Chinese/English typing A/B test or evidence of the
+historical game input state.
+
+### Initial frozen-source gate, 2026-11-13
+
+| Command | Exit / evidence |
+|---|---|
+| `uv lock --check --offline` | 0; lock and source/project versions agree on 0.5.0 |
+| `uv run --no-sync ruff check .` | 0; all checks passed |
+| `uv run --no-sync ruff format --check .` | 0; 90 files formatted |
+| `uv run --no-sync pytest -q -o faulthandler_timeout=30` | 0; **1036 passed in 35.33s** |
+| `uv run --no-sync python scripts/smoke_stdio.py` | 0; seven schemas, startup version/instance facts, default strict UIA |
+| `uv run --no-sync python scripts/verify_feedback.py` | 0; six Python IPC/MCP/JavaScript fidelity checks |
+| `uv run --no-sync python scripts/verify_windows.py` | 0; ten owned-window checks, PrintWindow and read-only input context |
+| `uv run --no-sync python scripts/verify_playback.py` | 0; ten decoded video frames, three PNG exports, compact montage |
+| `uv build` | 0; 0.5.0 wheel and source distribution |
+
+This was the initial gate before the second review’s additional issues; the new
+revalidation gate below supersedes it for current source.
+
+The full merged run followed final native/output/trace repairs. The owned UIA,
+PrintWindow and PyAV paths were not subsequently edited; their scoped evidence
+was reused rather than repeating desktop work. Synthetic input uses only fake
+adapters: the production native/runtime/wire integration does not invoke Win32
+input. A separate real read-only context query established available layout
+fields, not actual IME composition or application acceptance.
+
+The final narrow review returned **PASS**, independently repeating the original
+cancelled chord and message-cleanup cases using production NativeInput with
+fake adapters. At 2048/4096/6144/8192 response budgets, action-local release
+evidence survives independently of the final batch's zero-event cleanup; both
+MCP representations match and fit. Finally-release methods reflect actual
+PostMessage/SendInput calls; empty cleanup does not claim an input API call.
+Trace schema 2 retains one aggregate action-local cleanup without text/events.
+
+The built wheel's 26 Python modules were compared byte-for-byte with source.
+Global MCP configuration and executable hashes remained unchanged. This run
+does **not** install 0.5, commit, push, switch IME, alter remote-control settings,
+send real game input, prove WGC, or diagnose the historical FH6/Edge root cause.
+
+### Separately authorized chat-input observation
+
+After the frozen-source gate, the user explicitly authorized input in this
+session's composer. The same source NativeInput sent C then W as separate
+0.2-second scan-code holds. Each returned two accepted events and zero unknown;
+the observed scans were46/17, with no modifier keys down. Independent screenshots
+showed Chinese IME composition `c`, then `c'w` with updated candidates. Cleanup
+reported no remaining owned input. No Enter, Space, Unicode text, input-language
+switch or game action was sent. Composition was left unsubmitted for the user.
+
+This establishes real native-to-IME composition in that chat context only. It
+does not establish FH6 acceptance, IME as the historical game's sole cause, or
+English-layout A/B results. Receipts are `.artifacts/chat-ime-c-test.json` and
+`.artifacts/chat-ime-w-test.json`; source and global installation were unchanged.
+
+The user subsequently authorized a language-switch comparison. A separately
+started real 0.5 MCP sent one Win+Space chord, then the target thread was checked
+again before typing: language_id changed from0x0804 to0x0409. C/W scan-code holds
+through the MCP produced plain `cw` in the same chat input, with two accepted
+events per key and clean release. Independent screenshot showed no candidate
+window. No Enter, Unicode text, clipboard or game input was used. The English
+layout and unsent `cw` were left for the user; no automatic restore was issued.
+
+The switch action's immediate context still sampled the old layout, while the
+later check saw the new one. This reinforces non-atomic feedback semantics and
+the need to observe a changed precondition before subsequent input. ImmIsIME
+remained true under the English-labelled layout; it is not a composition/open
+status. The comparison establishes chat-context behavior, not FH6 causality.
+
 ## 0.4 application state and background messages
 
 The three new capabilities are documented in [v0.4.md](v0.4.md): explicit

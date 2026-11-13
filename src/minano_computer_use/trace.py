@@ -13,6 +13,76 @@ import time
 import uuid
 from pathlib import Path
 
+from .contracts import failure_details, receipt_facts
+from .wire import public_result
+
+
+def _binding_facts(value):
+    facts = {key: value[key] for key in ("pid", "hwnd") if type(value.get(key)) is int}
+    if "process_creation_time" in value:
+        facts["process_creation_time"] = value["process_creation_time"]
+    return public_result(facts)
+
+
+def _cleanup_facts(value):
+    """One cleanup outcome only; never descend into events or nested cleanup."""
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("status"), str)
+        or value.get("status")
+        not in {"ok", "invoked", "verified", "refused", "error", "unknown", "partial"}
+    ):
+        return {}
+    facts = {"status": value["status"]}
+    if isinstance(value.get("method"), str) and value["method"] in {
+        "SendInput",
+        "PostMessage",
+        "clipboard+keyboard",
+    }:
+        facts["method"] = value["method"]
+    for key in ("may_have_acted", "cancelled", "consumption_verified"):
+        if type(value.get(key)) is bool:
+            facts[key] = value[key]
+    error = value.get("error")
+    if (
+        isinstance(error, dict)
+        and isinstance(error.get("code"), str)
+        and error["code"]
+        in {
+            "CLEANUP_FAILED",
+            "CLEANUP_REQUIRED",
+            "CANCELLED",
+            "INPUT_FAILED",
+            "RELEASE_UNCONFIRMED",
+            "FOREGROUND_LOST",
+        }
+    ):
+        facts["error"] = {"code": error["code"]}
+    # Public event recipients are deliberately excluded from persisted trace facts.
+    receipt = receipt_facts(value.get("receipt"), include_recipients=False)
+    if receipt:
+        facts["receipt"] = receipt
+    return facts
+
+
+def _delivery_facts(value):
+    facts = {}
+    error = value.get("error")
+    if isinstance(error, dict):
+        details = failure_details(error.get("details"))
+        if details:
+            facts["failure_details"] = details
+    receipt = receipt_facts(value.get("receipt"), include_recipients=False)
+    if receipt:
+        facts["receipt"] = receipt
+    binding = value.get("target_binding")
+    if isinstance(binding, dict):
+        facts["target_binding"] = _binding_facts(binding)
+    cleanup = _cleanup_facts(value.get("cleanup"))
+    if cleanup:
+        facts["cleanup"] = cleanup
+    return facts
+
 
 def _safe_directory(path: Path) -> Path:
     path = path.absolute()
@@ -413,7 +483,8 @@ class TraceRecorder:
                 "system.clear_viewport",
             }
             event = {
-                "schema": 1,
+                "schema": 2,
+                "identity_time_format": "decimal_string_or_null",
                 "operation": operation if operation in known_operations else "other",
                 "timestamp": time.time(),
                 "monotonic": time.monotonic(),
@@ -431,11 +502,7 @@ class TraceRecorder:
             error = result.get("error")
             if isinstance(error, dict) and isinstance(error.get("code"), str):
                 event["error_code"] = error["code"][:80]
-            binding = result.get("target_binding")
-            if isinstance(binding, dict):
-                event["target_binding"] = {
-                    key: binding[key] for key in ("pid", "hwnd") if type(binding.get(key)) is int
-                }
+            event.update(_delivery_facts(result))
             data = result.get("data")
             if isinstance(data, dict):
                 for key in ("requested", "attempted", "completed", "stopped_early"):
@@ -444,6 +511,11 @@ class TraceRecorder:
                 cleanup = data.get("cleanup")
                 if isinstance(cleanup, dict) and isinstance(cleanup.get("status"), str):
                     event["cleanup_status"] = cleanup["status"][:32]
+                    cleanup_facts = _delivery_facts(cleanup)
+                    if type(cleanup.get("may_have_acted")) is bool:
+                        cleanup_facts["may_have_acted"] = cleanup["may_have_acted"]
+                    if cleanup_facts:
+                        event["cleanup"] = cleanup_facts
                 items = data.get("results")
                 if isinstance(items, list):
                     event["actions"] = [
@@ -466,8 +538,11 @@ class TraceRecorder:
                             action["error_code"] = error["code"][:80]
                         if isinstance(outcome.get("cancelled"), bool):
                             action["cancelled"] = outcome["cancelled"]
+                        if isinstance(outcome.get("may_have_acted"), bool):
+                            action["may_have_acted"] = outcome["may_have_acted"]
+                        action.update(_delivery_facts(outcome))
             path = self.store.allocate(".jsonl")
-            self.store.write_text(path, json.dumps(event, ensure_ascii=True) + "\n")
+            self.store.write_text(path, json.dumps(public_result(event), ensure_ascii=True) + "\n")
             self.store.register(path)
             with self._lock:
                 self._recorded += 1

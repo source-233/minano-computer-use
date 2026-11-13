@@ -7,6 +7,72 @@
 这是 MCP 工具参数，不是终端命令。名称取决于应用语言；先列窗口再读树。
 工具 schema 以 MCP `list_tools` 的结果为准。
 
+## 0.5：事实反馈与输出迁移
+
+原生动作默认带紧凑投递回执；需要详细的只读输入上下文时，在 act 或 play
+的顶层指定 `feedback="detailed"`，省略时为 `"compact"`。它不替代 screenshot：
+
+```json
+{
+  "target":"hwnd:0x123456",
+  "input_mode":"native",
+  "feedback":"detailed",
+  "screenshot":"auto",
+  "actions":[{"action":"hold","key":"W","seconds":0.2}]
+}
+```
+
+示例会发送真实输入，仅应在明确允许接管且已在前台的目标上使用。反馈不会
+为满足前置条件自行切窗、改输入法或更改远控设置。
+
+逐动作回执区分本次目标、实际事件、系统接受和松键提交。实际 SCANCODE
+事件中的 wVk 为 0，不能把请求解析的 VK 当成实际 wVk。text/paste 不返回
+字符序列、UTF-16 单元或剪贴板内容。测得的投递间隔不是游戏实际持键时间；
+系统接受 up 不等于已证明应用松键。
+
+回执位于逐动作结果的 `receipt`：`requested_events` 是实际尝试的事件数量，
+`accepted_events` 仅在全部返回可确认时为整数，有未知提交时为 null；
+`unknown_events` 明示未确认数量。`phases.down/up/other` 分别保留请求、已知
+接受和未知小计。`requested_seconds` 是请求时长，`dispatch_interval_seconds`
+是测得投递间隔。`events` 仅含有界的非文字按键明细，`events_omitted` 标注省略。
+最终字段以工具实际返回为准，不把未尝试的后续事件计作投递成功。
+
+输出预算不足时先省略辅助输入上下文和详细事件，保留核心计数、首次失败及
+清理不确定性。`accepted_events=null` 不能按零处理，也不能通过补发同一按键
+来“确认”原动作是否发生。
+
+详细输入上下文是只读的、非原子的观察，附来源和时间。HKL/ImmIsIME 只说明
+布局及 IME 关联，不证明正在中文组词；本版在动作释放/清理后采集，取消或
+本工具仍有持键时跳过，不是按住期间的实时状态。
+无法可靠查询的 open/conversion 状态
+明确 unknown。当前修饰键状态不是历史状态，也不表示该键由本工具持有。
+不提供猜测性的远程拦截布尔值，agent 应结合图像和应用状态自行诊断。
+
+修饰键观测值是 bool 或 null：查询返回零时可能是未按下，也可能是桌面/访问
+限制，无法区别就返回 null，不能自动解释为“所有修饰键都已松开”。混合已知与
+未知使用 partial，全部未知使用 unknown。它们不影响主动作结果或工具持键
+所有权；当前上下文只有在目标进程身份与线程复核后才标注一致。
+
+普通动作的 `target_binding` 标识本次请求解析的目标。已持有的消息按键释放
+仍发送到原收件控件；这时回执里的 `recipient_hwnd`/`recipient_pid` 标识实际
+接收者，method 来自实际投递记录，不因当前请求选了别的窗口而假装改用
+SendInput。精简预算可能省略事件明细，不应在明细缺失时猜测收件者。
+
+`consumption_verified=false` 仍表示“未确认消费”，而非“确认未消费”。辅助反馈
+失败不会把已投递动作改成 refused；取消和本工具所有者线程的松键优先。
+
+UIA state 拒绝的 error.details 提供静态 stage/predicate 与节点 index 等有界
+信息，区分实际不匹配和 provider 读取失败；不返回节点名称、值或原始异常。
+不要因下一次读取拒绝就重放已经可能生效的 invoke。
+
+所有对外 `process_creation_time` 从 0.4 的 number 改为 0.5 的十进制字符串，
+不可得时仍是 null，包括嵌套 binding 和截图元数据。MCP 的 text JSON 与
+structuredContent 类型一致；JavaScript 比较时保留字符串，不经过 Number。
+这仅是公开表示变化，内部 token、坐标与身份绑定仍执行精确比较。
+
+`system(action="status")` 返回运行实例与版本信息。只有确有构建依据时才报告
+构建标识，未知不填当前仓库 HEAD。磁盘包版本不能反向证明历史常驻进程版本。
+
 ## 0.4：三种输入通道
 
 | 选择 | 行为 | 前台要求 |
@@ -56,6 +122,8 @@ recipient 是目标根窗口或同进程子控件 HWND。消息通道明确绑�
   "target":"hwnd:0x123456",
   "include_ax":true,
   "include_screenshot":true,
+  "capture_mode":"window",
+  "allow_fallback":false,
   "rich":true,
   "text_limit":500,
   "depth":8,
@@ -70,6 +138,9 @@ recipient 是目标根窗口或同进程子控件 HWND。消息通道明确绑�
 图片仍是独立 MCP image 内容。state 不主动切到前台。两个组件绑定相同根窗口
 身份，并有各自时间及 component_errors；consistency="non_atomic" 明确不是同帧。
 一方失败仍保留另一方，整体报告 partial，而不是全部成功。
+`capture_mode`/`allow_fallback` 使用独立 screenshot 相同的已有后端与回退策略；
+省略仍为 screen/false。示例要求窗口自身后端，取图失败不会自动激活或改用
+桌面截图。根 binding 真失效时两个分量仍全部丢弃。
 
 关闭 include_ax 可完全跳过 UIA，关闭 include_screenshot 不取图；二者不能都关。
 全局前台窗口和目标内 UIA 焦点是不同概念，焦点不属于目标时不会泄漏别的应用内容。

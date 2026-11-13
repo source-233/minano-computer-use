@@ -32,6 +32,161 @@ def test_trace_allowlist_no_text_title_or_exception(tmp_path):
     store.close()
 
 
+def test_v05_trace_aggregate_receipts_static_failure_and_public_identity_only(tmp_path):
+    from minano_computer_use.runtime import Runtime
+
+    binding = {"hwnd": 123, "pid": 456, "process_creation_time": 134387468188212291}
+    outcome = {
+        "status": "unknown",
+        "may_have_acted": True,
+        "target_binding": binding,
+        "error": {
+            "code": "STALE_TARGET",
+            "message": "SECRET",
+            "details": {
+                "stage": "focus_before_read",
+                "node_index": 12,
+                "predicate": "ancestry_unavailable",
+                "error_type": "COMError",
+                "exception": "SECRET",
+            },
+        },
+        "receipt": {
+            "requested_events": 2,
+            "accepted_events": None,
+            "unknown_events": 2,
+            "events": [{"unicode": "SECRET"}],
+            "text": "SECRET",
+            "phases": {
+                "down": {"requested": 1, "accepted": None, "unknown": 1, "exception": "SECRET"}
+            },
+        },
+        "input_context": {"layout": "SECRET", "path": "SECRET"},
+    }
+    runtime = Runtime(output_dir=tmp_path, trace_enabled=True)
+    try:
+        runtime._log(
+            "act",
+            {},
+            {
+                "status": "unknown",
+                "data": {
+                    "results": [{"index": 0, "result": outcome}],
+                    "cleanup": {
+                        "status": "unknown",
+                        "may_have_acted": True,
+                        "receipt": outcome["receipt"],
+                    },
+                },
+            },
+        )
+        path = next(runtime._artifacts().root.glob("*.jsonl"))
+        text = path.read_text()
+        assert "SECRET" not in text and "input_context" not in text
+        event = json.loads(text)
+        action = event["actions"][0]
+        assert event["schema"] == 2
+        assert action["target_binding"]["process_creation_time"] == "134387468188212291"
+        assert action["receipt"]["accepted_events"] is None
+        assert action["failure_details"]["predicate"] == "ancestry_unavailable"
+        assert event["cleanup"]["receipt"]["accepted_events"] is None
+        assert event["cleanup"]["may_have_acted"] is True
+        assert type(binding["process_creation_time"]) is int
+    finally:
+        runtime.close()
+
+
+def test_trace_drops_nonstatic_failure_values_not_prefixes(tmp_path):
+    store = ArtifactStore(tmp_path)
+    trace = TraceRecorder(store, enabled=True)
+    try:
+        trace.record(
+            "window",
+            {},
+            {
+                "status": "refused",
+                "error": {
+                    "code": "STALE_TARGET",
+                    "details": {
+                        "predicate": "SECRET" * 1000,
+                        "stage": "SECRET",
+                        "error_type": "SECRET",
+                        "node_index": True,
+                    },
+                },
+            },
+        )
+        text = next(store.root.glob("*.jsonl")).read_text()
+        assert "SECRET" not in text and "failure_details" not in json.loads(text)
+    finally:
+        store.close()
+
+
+def test_action_local_cleanup_release_receipt_survives_both_trace_boundaries(tmp_path):
+    from minano_computer_use.runtime import Runtime
+
+    def receipt(down, up):
+        return {
+            "requested_events": down + up,
+            "accepted_events": down + up,
+            "unknown_events": 0,
+            "phases": {
+                "down": {"requested": down, "accepted": down, "unknown": 0},
+                "up": {"requested": up, "accepted": up, "unknown": 0},
+            },
+            "events": [{"character": "SECRET", "w_scan": 30}],
+        }
+
+    cleanup = {
+        "status": "ok",
+        "method": "SendInput",
+        "receipt": receipt(0, 1),
+        "may_have_acted": True,
+        "consumption_verified": False,
+        "text": "SECRET",
+        "input_context": {"value": "SECRET"},
+    }
+    cleanup["cleanup"] = cleanup  # Not a request for arbitrary recursive trace serialization.
+    outcome = {
+        "status": "unknown",
+        "cancelled": True,
+        "may_have_acted": True,
+        "receipt": receipt(1, 0),
+        "cleanup": cleanup,
+        "target_binding": {"hwnd": 123, "pid": 456, "process_creation_time": 134387468188212291},
+    }
+    runtime = Runtime(output_dir=tmp_path, trace_enabled=True)
+    try:
+        runtime._log(
+            "act",
+            {},
+            {
+                "status": "unknown",
+                "data": {
+                    "results": [{"index": 0, "result": outcome}],
+                    "cleanup": {"status": "ok", "receipt": receipt(0, 0)},
+                },
+            },
+        )
+        content = next(runtime._artifacts().root.glob("*.jsonl")).read_text()
+        event = json.loads(content)
+        action = event["actions"][0]
+        assert event["schema"] == 2
+        assert action["target_binding"]["process_creation_time"] == "134387468188212291"
+        assert action["receipt"]["phases"]["down"]["accepted"] == 1
+        assert action["receipt"]["phases"]["up"]["accepted"] == 0
+        assert action["cleanup"]["receipt"]["phases"]["up"]["accepted"] == 1
+        assert action["cleanup"]["status"] == "ok"
+        assert action["cleanup"]["method"] == "SendInput"
+        assert action["cleanup"]["consumption_verified"] is False
+        assert event["cleanup"]["receipt"]["phases"]["up"]["accepted"] == 0
+        assert "cleanup" not in action["cleanup"]
+        assert "SECRET" not in content and '"events"' not in content
+        assert '"input_context"' not in content
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize(
     "operation",
     ["process.shell", "process.kill", "system.set_clipboard", "system.get_clipboard"],

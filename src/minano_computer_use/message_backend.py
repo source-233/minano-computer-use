@@ -6,12 +6,14 @@ performed by the disposable, fixed message worker.
 
 from __future__ import annotations
 
+import copy
 import ctypes
 import math
 import time
 from contextlib import nullcontext
 
 from .contracts import result
+from .coordinates import CoordinateError, validate_window
 from .input_plan import EXTENDED_KEYS, bounded_seconds, normalize_native_action
 
 _MOUSE = {"move", "click", "mouse_down", "mouse_up", "drag", "wheel"}
@@ -120,6 +122,18 @@ class BackgroundInput:
         self._buttons = {}
         self._deadline = 0.0
         self._acted = False
+        self._coordinate_binding = None
+
+    def _pin_coordinates(self, target):
+        pin = self._coordinate_binding
+        if pin is None:
+            return
+        binding = {key: pin[key] for key in ("hwnd", "pid", "process_creation_time")}
+        if target != f"hwnd:{binding['hwnd']}" or (
+            target in self._bindings and self._bindings[target] != binding
+        ):
+            raise _MessageError("STALE_CAPTURE")
+        self._bindings[target] = binding
 
     def set_cancel_event(self, event):
         if event is not None and not hasattr(event, "is_set"):
@@ -140,6 +154,11 @@ class BackgroundInput:
 
     def _remote(self, action, target=None, timeout=5.0):
         name = action["action"]
+        if name != "message_release":
+            try:
+                self._pin_coordinates(target)
+            except _MessageError as exc:
+                return self._response("refused", name, code=exc.code, may_have_acted=False)
         if self._lost_holds:
             return self._response(
                 "unknown",
@@ -195,6 +214,9 @@ class BackgroundInput:
                 "target": target,
                 "timeout": remaining,
                 "binding": self._bindings.get(target),
+                "coordinate_binding": (
+                    None if name == "message_release" else self._coordinate_binding
+                ),
             },
             timeout=remaining,
             cancel_event=None if name == "message_release" else self._cancel_event,
@@ -245,6 +267,17 @@ class BackgroundInput:
             raise _MessageError("CANCELLED")
         if time.monotonic() >= self._deadline:
             raise _MessageError("TIMEOUT")
+        if not cleanup and self._coordinate_binding is not None:
+            snapshot = getattr(self._adapter, "window_snapshot", None)
+            if not callable(snapshot):
+                raise _MessageError("CAPTURE_BINDING_UNAVAILABLE")
+            try:
+                current = snapshot(binding["hwnd"])
+                validate_window(self._coordinate_binding, current)
+            except CoordinateError as exc:
+                raise _MessageError("STALE_CAPTURE") from exc
+            except Exception as exc:
+                raise _MessageError("CAPTURE_BINDING_UNAVAILABLE") from exc
         actual = self._adapter.identity(binding["hwnd"], binding["pid"])
         if actual != binding or not actual.get("process_creation_time"):
             raise _MessageError("STALE_TARGET")
@@ -499,7 +532,14 @@ class BackgroundInput:
                 self._button(binding, recipient, action["button"], x, y, up=True)
         return False
 
-    def execute(self, action, target, timeout=5.0):
+    def execute(self, action, target, timeout=5.0, *, coordinate_binding=None):
+        self._coordinate_binding = copy.deepcopy(coordinate_binding)
+        try:
+            return self._execute(action, target, timeout)
+        finally:
+            self._coordinate_binding = None
+
+    def _execute(self, action, target, timeout=5.0):
         name = action.get("action", "") if isinstance(action, dict) else ""
         try:
             action = normalize_message_action(action)
@@ -522,6 +562,7 @@ class BackgroundInput:
         before, after, binding, recipient = None, None, self._bindings.get(target), None
         try:
             before = self._adapter.observations()
+            self._pin_coordinates(target)
             binding = self._bind(target)
             # Releases use their original recipient even if target thread focus changed.
             if name == "key_up":

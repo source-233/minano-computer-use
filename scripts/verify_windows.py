@@ -153,6 +153,42 @@ def main() -> None:
         assert budgeted["status"] == "ok", budgeted
         assert len(json.dumps(budgeted, ensure_ascii=False).encode()) <= 4096
         report["checks"]["budgeted_tree"] = True
+        # 组合观察只读现有自有窗口；窗口后端不借用真实键鼠或隐式激活。
+        state = runtime.window(
+            "state",
+            target=target,
+            include_ax=True,
+            include_screenshot=True,
+            capture_mode="printwindow",
+            allow_fallback=False,
+            depth=4,
+            max_nodes=100,
+            timeout=10,
+        )
+        frame = state.pop("frame", None)
+        report["window_state"] = state
+        assert state["status"] == "ok", state
+        assert frame is not None, state
+        data = state["data"]
+        assert data["consistency"] == "non_atomic", data
+        assert data["uia"]["root_binding"] == state["target_binding"], data
+        assert data["screenshot"]["hwnd"] == hwnd, data
+        assert data["screenshot"]["capture_backend"] == "printwindow", data
+        assert not data["component_errors"], data
+        report["checks"]["bound_state_explicit_printwindow"] = True
+        from minano_computer_use.input_context import read_input_context
+        from minano_computer_use.native import _Win32Adapter
+
+        context = read_input_context(_Win32Adapter(), state["target_binding"])
+        report["read_only_input_context"] = context
+        assert context["status"] == "partial", context
+        assert context["non_atomic"] is True
+        fields = context["fields"]
+        assert fields["keyboard_layout"]["status"] == "known", context
+        assert fields["keyboard_layout"]["value"]["hkl"] > 0, context
+        assert fields["ime_open"]["status"] == "unknown", context
+        assert fields["ime_conversion"]["status"] == "unknown", context
+        report["checks"]["read_only_input_context_unknowns_preserved"] = True
         report["passed"] = True
     finally:
         if runtime is not None:

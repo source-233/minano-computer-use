@@ -9,6 +9,8 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from minano_computer_use import __version__
+
 
 async def main() -> None:
     root = Path(__file__).resolve().parents[1]
@@ -41,9 +43,12 @@ async def main() -> None:
                 schemas = {tool.name: tool.inputSchema["properties"] for tool in tools.tools}
                 for name in ("act", "play"):
                     assert "input_mode" in schemas[name]
+                    assert schemas[name]["feedback"]["default"] == "compact"
                 assert {"rich", "text_limit", "include_ax", "include_screenshot"} <= set(
                     schemas["window"]
                 )
+                assert schemas["window"]["capture_mode"]["default"] == "screen"
+                assert schemas["window"]["allow_fallback"]["default"] is False
                 assert all("ctx" not in schema for schema in schemas.values())
                 status = await client.call_tool("system", {"action": "status"})
                 assert not status.isError, status
@@ -56,6 +61,12 @@ async def main() -> None:
                     "message",
                 ]
                 assert status.structuredContent["data"]["uia_worker_started"] is False
+                identity = status.structuredContent["data"]
+                assert identity["package_version"] == __version__
+                assert len(identity["instance_id"]) == 32
+                assert type(identity["pid"]) is int and identity["pid"] > 0
+                assert identity["started_at"] > 0
+                assert identity["build"] is None and identity["revision"] is None
                 windows = await client.call_tool("window", {"action": "list"})
                 assert not windows.isError, windows
                 refused = await client.call_tool(
@@ -70,6 +81,10 @@ async def main() -> None:
                 assert refused.structuredContent["status"] == "refused"
                 final_status = await client.call_tool("system", {"action": "status"})
                 assert not final_status.structuredContent["data"]["uia_worker_started"]
+                assert all(
+                    final_status.structuredContent["data"][key] == identity[key]
+                    for key in ("instance_id", "package_version", "pid", "started_at")
+                )
                 report = {
                     "server": initialized.serverInfo.model_dump(mode="json"),
                     "protocol_version": initialized.protocolVersion,
