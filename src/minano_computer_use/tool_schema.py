@@ -513,11 +513,13 @@ COMMON = {
     ),
     "allow_shell": spec(
         "Shell/probe permission; also requires --allow-shell. Default off. "
-        "Runs with this Windows user's rights, not a sandbox."
+        "Runs with this Windows user's rights, not a sandbox. "
+        "Missing gate returns PERMISSION_REQUIRED and identifies the missing layer."
     ),
     "allow_process_control": spec(
         "Kill/close permission; also requires --allow-process-control. "
-        "Default off; may lose unsaved work."
+        "Default off; may lose unsaved work. Missing gate returns PERMISSION_REQUIRED "
+        "and identifies startup versus per-call permission."
     ),
 }
 PARAMETERS = {

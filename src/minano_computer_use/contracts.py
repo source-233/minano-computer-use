@@ -37,6 +37,28 @@ NATIVE_ACTIONS = frozenset(
 )
 STOP_STATUSES = frozenset({"refused", "error", "unknown", "partial"})
 
+
+class PermissionRequired(Exception):
+    """A missing explicit permission, not an invalid action argument."""
+
+    code = "PERMISSION_REQUIRED"
+
+    def __init__(self, permission, startup, call):
+        flag = "--allow-" + permission.replace("_", "-")
+        missing = []
+        if not startup:
+            missing.append(f"startup option {flag}")
+        if call is not True:
+            missing.append(f"per-call allow_{permission}=true")
+        super().__init__("Missing permission: " + "; ".join(missing))
+
+
+def require_permission(permission, startup, call):
+    """Keep startup and call gates separate; do not change authorization policy."""
+    if not startup or call is not True:
+        raise PermissionRequired(permission, startup, call)
+
+
 # Provider diagnostics are facts, never a channel for exception text or values.
 FAILURE_PREDICATES = frozenset(
     {
@@ -61,6 +83,11 @@ FAILURE_PREDICATES = frozenset(
         "provider_property_unavailable",
         "token_binding_changed",
         "token_metadata_changed",
+        "cross_process_membership_unavailable",
+        "cross_process_anchor_unavailable",
+        "element_process_unavailable",
+        "element_process_changed",
+        "element_process_or_anchor_changed",
     }
 )
 FAILURE_STAGES = frozenset(
@@ -88,6 +115,7 @@ FAILURE_STAGES = frozenset(
         "token_binding_before_publication",
         "set_value_initial_control",
         "set_value_verification",
+        "cross_process_binding",
     }
 )
 FAILURE_ERROR_TYPES = frozenset(

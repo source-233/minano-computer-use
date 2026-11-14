@@ -1,5 +1,57 @@
 # Verification evidence and limits
 
+## 0.5.3: hosted UIA, permission diagnostics and rectangle spaces
+
+Issues #1/#2 and the remaining metadata suggestion from withdrawn #3 are addressed
+in this release. This does not claim that the reporter's UWP environment has been
+reproduced.
+
+- Cross-process UIA descendants require a bounded live raw-view ancestry path to
+  the pinned host root, a same-element-process native HWND on that path, Win32
+  descendant/owner validation, and a separate readable process creation identity.
+  State, token issue/use and semantic mutations share this proof. Tokens retain
+  the original native anchor, ancestry and process identity, never silently rebind.
+  Missing native anchors, root-PID mismatch, unavailable identity, detachment and
+  reused processes remain refusals. Executable names grant no trust.
+- Missing startup and/or call permissions produce `PERMISSION_REQUIRED` with only
+  the missing layers named. Close, kill and shell/probe keep their original double
+  gates; no operation is made available by changing an error code.
+- Window rectangle values remain exclusive LTRB, with independently observed
+  calling-thread DPI space. Capture labels window versus surface bounds, crop and
+  response scaling. Known virtualized/unknown screen rectangles do not fabricate
+  a physical transform; image-input identity validation also compares known spaces.
+
+Final automated gate: Ruff check/format (103 files), **1349 tests**, real MCP stdio,
+feedback round-trip, lock validation and wheel/source build all exit 0. New tests
+cover hosted identity/lifecycle/token loss, before/after-write deadlines, permission
+combinations through MCP, unchanged rectangle values and coordinate-space refusal.
+The cancellation saturation fixture now signals entry into action execution before
+requesting cancellation; operation admission alone did not establish that point.
+No production cancellation behavior or timeout was changed to make that test pass.
+
+Real evidence: `scripts/verify_windows.py` passes all 13 owned-window checks.
+`scripts/verify_hosted_uia.py` creates a standard Edit in a second owned process,
+obtains its state token under the host HWND, writes once, and independently checks
+the value with native WM_GETTEXT. That functional sequence passed. Earlier complete
+functional runs exited 0; the final strengthened run also passed all three functional
+checks but detected physical cursor movement during the non-atomic interval and
+therefore records **passed=false**. Both fixtures exited 0. It was not automatically
+replayed, nor counted as a no-cursor-change pass. Current report:
+`.artifacts/hosted-uia-smoke.json`. This proves no universal Calculator/UWP support;
+the exact ApplicationFrameHost topology on the issue reporter's machine remains
+unverified. No user app, game input or IME switch was used for these checks.
+
+The verified 0.5.3 wheel was deployed to the global MCP with a 0.5.2 rollback wheel
+and configuration backup. An isolated import from the installed uv tool environment
+matched all 28 package modules to the verified source. Installed stdio/feedback
+checks exited 0; the seven tool definitions match the source report. A separate
+installed-executable check confirmed four permission refusals before effects and
+rectangle format/space metadata on 26 enumerated windows. Reports are retained in
+`.artifacts/installed-0.5.3/`. The reconnected live status reports 0.5.3, strict UIA
+default, and shell/process-control gates disabled; configuration was restored
+byte-for-byte. No hosted desktop experiment was replayed during deployment, and the
+previous `passed=false` cursor-interference evidence remains unchanged.
+
 ## 0.5.2 tool-definition usability
 
 The seven existing tools now describe all 122 public parameters, their valid values,

@@ -43,6 +43,9 @@ below is historical where superseded by parity.md.
 - `contracts.py`: JSON result helper and operation sets; no Windows imports.
 - `win32.py`: list/resolve HWND targets, foreground/cursor observations; no implicit focus.
 - `uia_backend.py`: one `UIABackend` instance, created and used on the UIA child main thread.
+- `uia_membership.py`: bounded live cross-process UIA/native-descendant proof on that
+  same thread. Host HWND/PID/creation identity and element process/native anchor are
+  distinct pins; tokens retain original proof and never reacquire a stale binding.
 - `worker.py`: JSON-only multiprocessing Pipe server, imports UIA only inside the child.
 - `broker.py`: spawn process, send one request at a time, hard deadline, kill/join on timeout;
   never replay an interrupted action. Injectable worker function supports deterministic tests.
@@ -63,6 +66,9 @@ All arguments/results crossing processes must be JSON-serializable. No UIA/COM o
 
 `win32.list_windows() -> list[dict]`: each entry has `hwnd` (int), `pid`, `title`, `rect`
 ([left, top, right, bottom]), `visible`, `minimized`.
+`rect_format/rect_space/rect_source` describe GetWindowRect's actual calling-thread
+DPI space without changing its coordinates or DPI context. Capture separately labels
+window boundaries, surface bounds, crop coordinates and response-image scale.
 
 `win32.resolve_window(target: str) -> dict`: accepts `hwnd:0x...`, `pid:123`, exact title
 (case-insensitive), then unique title substring. `foreground` is explicit. Reject ambiguity.

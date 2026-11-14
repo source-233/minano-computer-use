@@ -17,7 +17,7 @@ from ctypes import wintypes as W
 from dataclasses import dataclass
 from pathlib import Path
 
-from .contracts import result
+from .contracts import PermissionRequired, require_permission, result
 from .jobs import (
     JobRunner,
     ServiceError,
@@ -455,10 +455,10 @@ class AutomationServices:
         )
 
     def _gate(self, permission, call_flag):
-        if not getattr(self, "allow_" + permission) or call_flag is not True:
-            raise ServiceError(
-                "PERMISSION_REQUIRED", "Startup and per-call permission are required"
-            )
+        try:
+            require_permission(permission, getattr(self, "allow_" + permission), call_flag)
+        except PermissionRequired as exc:
+            raise ServiceError(exc.code, str(exc)) from None
 
     def _protected(self):
         protected = {

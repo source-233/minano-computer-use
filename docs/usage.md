@@ -173,6 +173,12 @@ recipient 是目标根窗口或同进程子控件 HWND。消息通道明确绑�
 全局前台窗口和目标内 UIA 焦点是不同概念，焦点不属于目标时不会泄漏别的应用内容。
 选区只从已证明属于目标的控件读出；未知、无焦点或不支持时明确标注 unavailable。
 
+宿主 HWND 的进程与 UIA 控件进程可以不同。跨进程控件需要实时 UIA 祖先链到达
+同一根，且该路径上存在属于控件进程的原生 HWND，并被 Win32 确认为宿主的子窗口。
+分别校验宿主和控件进程创建时间；token 保存原锚点／归属，使用时不得换绑。
+控件可没有 HWND，但祖先必须提供同进程锚点。无锚点、身份不可读、链断开、根进程
+不等于目标宿主等情形仍拒绝；不按进程名豁免，不表示所有 UWP 拓扑都支持。
+
 tree/text/find/inspect 可指定 rich=true，查看类名、原生 HWND、启用/离屏/焦点状态、
 矩形、当前值和 actions 提示。每个可选属性的读取失败分别报告，不用 false 冒充
 不可读取。provider 的屏幕坐标不自动等于可安全点击的物理坐标；几何信息不启用
@@ -390,6 +396,21 @@ capture_mode 可选 screen（默认）、window（PrintWindow 后 WGC）、print
 WGC item 的像素不能无证据等同 GetWindowRect 物理屏幕坐标；变换不明确就返回未知。
 不因纯黑图就武断断言失败，也不把超时包装成有效图片。
 
+### 矩形格式与坐标空间
+
+- `window.list` 的 `rect` 配有 `rect_format="left_top_right_bottom"`，右／下边界不含。
+  宽高应计算 `right-left`、`bottom-top`，不要把后两项当作宽高。
+- `rect_space` 根据读取线程的实际 DPI awareness 标为 `physical_screen`、
+  `dpi_virtualized_screen`、`system_dpi_screen`、`win32_screen_unknown` 或 `unavailable`。
+  不改变调用方 DPI 上下文，不把未知空间冒称 DIP 或物理像素。
+- 截图的 `window_rect_format/window_rect_space` 单独标识窗口边界，图像范围另用
+  `surface_bounds=[0,0,width,height]`、`surface_bounds_space="surface_pixels"`。
+  `region_result_space="surface_pixels"` 说明返回的 region 已换成原始图像内坐标。
+- `scale_from="cropped_surface_pixels"`、`scale_to="output_pixels"` 表示 response 缩放；
+  montage 则从 `montage_pixels` 缩放。`scale` 不适用于窗口矩形／DPI 换算。
+- `physical_transform` 是独立的已知物理映射。明确为虚拟化／未知空间的窗口截图，
+  不发布猜测性的映射；未知即 null。多显示器 DPI 换算不能只乘 `dpi/96`。
+
 可用启动参数开启脱敏轨迹与配额：
 
 ```powershell
@@ -516,6 +537,12 @@ uv run minano-computer-use --allow-shell --allow-process-control
 
 调用 shell 仍要传 `allow_shell=true`；kill 或 window.close 仍要传
 `allow_process_control=true`。这两个门禁与便捷的 native 开关独立。
+
+缺少任一层许可返回 `refused / PERMISSION_REQUIRED`，message 分别指出缺少的
+`startup option --allow-shell/--allow-process-control` 和／或单次
+`allow_shell=true/allow_process_control=true`。单次传 true 不会绕过启动门禁。
+`close` 仍发送优雅 WM_CLOSE，但可能丢失数据，保留与 kill 相同的双重许可；
+这项修复只改善权限诊断，没有降低关闭／终止的授权要求。
 shell 子进程先暂停创建、放入 Job Object，再运行；取消/超时清理其子树。
 普通 launch 的应用不会在 MCP 退出时被当作工作进程杀掉。
 进程名多匹配拒绝，批量终止必须显式 all=true；不允许终止服务及其活动 worker。

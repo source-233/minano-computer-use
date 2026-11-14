@@ -142,6 +142,12 @@ def validate_window(
     actual = current.get("window_rect", current.get("rect"))
     if geometry and (rect is None or actual is None or list(rect) != list(actual)):
         raise CoordinateError("captured window geometry changed")
+    expected_space = expected.get("window_rect_space", expected.get("rect_space"))
+    current_space = current.get(
+        "window_rect_space", current.get("rect_space", "win32_screen_unknown")
+    )
+    if geometry and expected_space is not None and expected_space != current_space:
+        raise CoordinateError("captured window rectangle coordinate space changed")
     if geometry and expected.get("dpi") != current.get("dpi"):
         raise CoordinateError("captured window DPI changed")
 

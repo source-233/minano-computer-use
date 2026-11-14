@@ -67,6 +67,28 @@ def stdio_fixture(report_path):
     camera = SafeCamera()
 
     class SafeRuntime(Runtime):
+        def _run_actions(self, *args, **kwargs):
+            # Admission alone is not proof that a batch reached its first action.
+            # Mark inside the action's interruptible wait so cancellation is
+            # guaranteed to produce that action's result, not a pre-batch refusal.
+            operation = kwargs.get("operation")
+            if operation is None:
+                return super()._run_actions(*args, **kwargs)
+            original_wait = operation.wait
+
+            def entered_wait(seconds):
+                if seconds == 30:
+                    Path(str(report_path) + ".entered").write_text(
+                        operation.call_id, encoding="utf-8"
+                    )
+                return original_wait(seconds)
+
+            operation.wait = entered_wait
+            try:
+                return super()._run_actions(*args, **kwargs)
+            finally:
+                operation.wait = original_wait
+
         def close(self):
             super().close()
             Path(report_path).write_text(
@@ -213,6 +235,11 @@ def test_real_stdio_cancel_bypasses_saturated_executor_and_stops_batch(tmp_path)
             },
         )
         owner_id = client.wait_active()
+        entered = Path(str(report) + ".entered")
+        deadline = time.monotonic() + 3
+        while not entered.exists() or entered.read_text(encoding="utf-8") != owner_id:
+            assert time.monotonic() < deadline, "Admitted batch did not enter action execution"
+            time.sleep(0.005)
         # More queued threads than the default executor's maximum of 32.
         queued = [
             client.tool(

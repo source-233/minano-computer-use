@@ -16,6 +16,7 @@ from ctypes import wintypes
 from . import win32 as default_win32
 from .contracts import READ_ACTIONS, UIA_ACTIONS, result
 from .output import bound_result, validate_budget
+from .uia_membership import cross_process_pin
 
 
 class Refusal(Exception):
@@ -59,6 +60,8 @@ class UIABackend:
         self._clock = clock or time.monotonic
         self._sleep = sleep or time.sleep
         self._tokens = OrderedDict()
+        self._memberships = {}
+        self._candidate_pids = {}
         self.win32 = win32 or default_win32
         if auto is None:
             if threading.current_thread() is not threading.main_thread():
@@ -85,6 +88,8 @@ class UIABackend:
         if self._initialized:
             self.auto.UninitializeUIAutomationInCurrentThread()
         self._tokens.clear()
+        self._memberships.clear()
+        self._candidate_pids.clear()
         self._closed = True
 
     def execute(self, request: dict) -> dict:
@@ -95,6 +100,8 @@ class UIABackend:
         self._may_have_acted = False
         self._target_binding = None
         self._issued_this_call = 0
+        self._memberships = {}
+        self._candidate_pids = {}
         budgets = (24000, 65536)
         try:
             try:
@@ -433,8 +440,42 @@ class UIABackend:
                     else "candidate_runtime_id_changed"
                 )
             check()
-            if int(control.ProcessId) != expected["pid"]:
-                return self._membership_failure("candidate_pid_mismatch")
+            candidate_pid = int(control.ProcessId)
+            key = (
+                expected["hwnd"],
+                expected["pid"],
+                expected["process_creation_time"],
+                root_id,
+                original_id,
+            )
+            memberships = getattr(self, "_memberships", {})
+            previous = memberships.get(key)
+            candidate_pids = getattr(self, "_candidate_pids", {})
+            if key in candidate_pids and candidate_pid != candidate_pids[key]:
+                return self._membership_failure("element_process_changed")
+            candidate_pids[key] = candidate_pid
+            self._candidate_pids = candidate_pids
+            if candidate_pid != expected["pid"]:
+                if not hasattr(self.win32, "child_window_identity"):
+                    return self._membership_failure("candidate_pid_mismatch")
+                predicate = "cross_process_membership_unavailable"
+                pin, failure = cross_process_pin(
+                    self,
+                    control,
+                    root,
+                    expected,
+                    original_id,
+                    root_id,
+                    previous=previous,
+                    checkpoint=checkpoint,
+                )
+                if failure:
+                    return self._membership_failure(failure)
+                memberships[key] = pin
+                self._memberships = memberships
+                return None
+            if previous is not None:
+                return self._membership_failure("element_process_changed")
             predicate = "ancestry_unavailable"
             ancestor = control
             for _ in range(64):
@@ -483,6 +524,10 @@ class UIABackend:
             )
         except _VerificationExpired:
             raise
+        except Refusal as exc:
+            if exc.code == "DEADLINE_EXCEEDED":
+                raise
+            return self._membership_failure(predicate, exc)
         except Exception as exc:
             return self._membership_failure(predicate, exc)
 
@@ -839,6 +884,15 @@ class UIABackend:
         ):
             entry["token_unavailable"] = "Reliable bounded RuntimeId/metadata unavailable"
             return
+        membership = self._cross_membership(window, root, control, identity, root_id, element_id)
+        if membership is not None and (
+            metadata["pid"] != membership["pid"]
+            or self._metadata(control) != metadata
+            or self._metadata(root) != root_metadata
+        ):
+            self._refuse_membership(
+                "cross_process_binding", 0, self._membership_failure("token_metadata_changed")
+            )
         if self._issued_this_call >= 256:
             entry["token_unavailable"] = "Per-response token limit reached"
             return
@@ -858,6 +912,7 @@ class UIABackend:
             "root_metadata": root_metadata,
             "metadata": metadata,
             "identity": identity,
+            "membership": membership,
         }
         entry["token"] = token
         entry["token_ttl_seconds"] = 60
@@ -890,6 +945,26 @@ class UIABackend:
                 or self._metadata(control, checkpoint=checkpoint) != cached["metadata"]
             ):
                 raise ValueError("Live root/element identity changed")
+            pin = cached.get("membership")
+            key = (
+                identity["hwnd"],
+                identity["pid"],
+                identity["process_creation_time"],
+                cached["root_id"],
+                cached["element_id"],
+            )
+            self._candidate_pids[key] = cached["metadata"]["pid"]
+            if pin is not None:
+                self._memberships[key] = pin
+            self._cross_membership(
+                window,
+                root,
+                control,
+                identity,
+                cached["root_id"],
+                cached["element_id"],
+                checkpoint=checkpoint,
+            )
             # A still-readable but detached/reparented cached element is not a bound target.
             ancestor = control
             for _ in range(64):
@@ -911,6 +986,37 @@ class UIABackend:
                 raise
             del self._tokens[token]
             raise Refusal("STALE_TOKEN", "Token binding no longer valid; discover again") from exc
+
+    def _cross_membership(
+        self, window, root, control, identity, root_id, element_id, *, checkpoint=None
+    ):
+        """Apply one cross-process proof to tokens and direct semantic mutations."""
+        check = checkpoint or (lambda: None)
+        check()
+        self._runtime_id(control, checkpoint=checkpoint)
+        check()
+        pid = int(control.ProcessId)
+        check()
+        key = (
+            identity["hwnd"],
+            identity["pid"],
+            identity["process_creation_time"],
+            root_id,
+            element_id,
+        )
+        previous = self._memberships.get(key)
+        if key in self._candidate_pids and pid != self._candidate_pids[key]:
+            self._refuse_membership(
+                "cross_process_binding", 0, self._membership_failure("element_process_changed")
+            )
+        self._candidate_pids[key] = pid
+        if pid != identity["pid"] or previous is not None:
+            failure = self._state_live_candidate(
+                control, element_id, root, root_id, identity, checkpoint=checkpoint
+            )
+            if failure is not None:
+                self._refuse_membership("cross_process_binding", 0, failure)
+        return self._memberships.get(key)
 
     def _walk(self, root, depth, max_nodes, *, checkpoint=None):
         """Bound sibling walking too: GetChildren would materialize an unbounded list."""
@@ -1294,6 +1400,21 @@ class UIABackend:
                 request, window, root, control, initial_binding, root_pointer, depth, maximum
             )
         self._bind(window, root, control)
+        mutation_guard = None
+        if action not in READ_ACTIONS:
+            identity = {
+                key: initial_binding[key] for key in ("hwnd", "pid", "process_creation_time")
+            }
+            rid = tuple(initial_binding["root_runtime_id"] or ())
+            cid = self._runtime_id(control)
+            pin = self._cross_membership(window, root, control, identity, rid, cid)
+            if pin is not None:
+
+                def mutation_guard():
+                    failure = self._state_live_candidate(control, cid, root, rid, identity)
+                    if failure is not None:
+                        self._refuse_membership("cross_process_binding", 0, failure)
+
         if action in {"tree", "text"}:
             nodes, truncated = self._walk(control, depth, maximum)
             unsafe_text = (
@@ -1365,7 +1486,22 @@ class UIABackend:
                     key: value for key, value in data["patterns"].items() if value is not None
                 }
             return result("ok", action, method="uia", data=data)
-        return self._mutate(control, action, request)
+        try:
+            return self._mutate(control, action, request, guard=mutation_guard)
+        except Refusal as exc:
+            if not self._may_have_acted:
+                raise
+            response = result(
+                "unknown",
+                action,
+                method="uia",
+                code=exc.code,
+                message="UIA mutation lost its bound membership",
+                may_have_acted=True,
+            )
+            if exc.details is not None:
+                response["error"]["details"] = exc.details
+            return response
 
     def _set_value(self, request, window, root, control, binding, root_pointer, depth, maximum):
         """One write, then bounded reads of the pinned live reference (never Refind)."""
@@ -1446,7 +1582,6 @@ class UIABackend:
                 raise Refusal("READ_ONLY", "Value pattern is read-only")
             privacy()
             before = pattern.Value
-            guard()
             privacy()
             setter = pattern.SetValue
             guard()
@@ -1458,7 +1593,8 @@ class UIABackend:
                 privacy()
                 checkpoint()
                 after = pattern.Value
-                guard()
+                # privacy() already guards before AND after its provider reads;
+                # an extra guard here adds the same cross-process RPC traversal.
                 privacy()
                 if after == request["value"]:
                     break
@@ -1518,7 +1654,9 @@ class UIABackend:
     def _bounded_property(value):
         return value[:4096] if isinstance(value, str) else value
 
-    def _mutate(self, control, action, request):
+    def _mutate(self, control, action, request, *, guard=None):
+        check = guard or (lambda: None)
+        check()
         pattern_name = {
             "invoke": "Invoke",
             "toggle": "Toggle",
@@ -1585,8 +1723,11 @@ class UIABackend:
             )
             no_amount = self.auto.ScrollAmount.NoAmount
             args = [enum, no_amount] if axis == "Horizontal" else [no_amount, enum]
+        setter = getattr(pattern, method)
+        check()
         self._may_have_acted = True
-        returned = getattr(pattern, method)(*args, waitTime=0)
+        returned = setter(*args, waitTime=0)
+        check()
         # Pattern methods are not obliged to return a boolean; never publish an
         # arbitrary provider object/string (which can contain entered text).
         data = {
@@ -1606,6 +1747,7 @@ class UIABackend:
                 )
             return result("invoked", action, method="uia", data=data)
         after = readback()
+        check()
         data["after"] = self._bounded_property(after)
         if action == "toggle":
             verified = after in (0, 1, 2) and after != before

@@ -48,6 +48,24 @@ def _user32():
     return user32
 
 
+def rect_coordinate_space(user32) -> str:
+    """Observe caller DPI context; never alter it or infer a DIP conversion."""
+    try:
+        context = user32.GetThreadDpiAwarenessContext
+        context.argtypes, context.restype = [], ctypes.c_void_p
+        awareness = user32.GetAwarenessFromDpiAwarenessContext
+        awareness.argtypes, awareness.restype = [ctypes.c_void_p], ctypes.c_int
+        current = context()
+        if not current:
+            return "win32_screen_unknown"
+        value = awareness(current)
+        return {2: "physical_screen", 0: "dpi_virtualized_screen", 1: "system_dpi_screen"}.get(
+            value, "win32_screen_unknown"
+        )
+    except (AttributeError, OSError):
+        return "win32_screen_unknown"
+
+
 def _window_entry(hwnd: int, user32) -> dict:
     handle = wintypes.HWND(hwnd)
     if not user32.IsWindow(handle):
@@ -58,15 +76,22 @@ def _window_entry(hwnd: int, user32) -> dict:
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
     rect = wintypes.RECT()
+    before_space = rect_coordinate_space(user32)
     if not user32.GetWindowRect(handle, ctypes.byref(rect)):
         rect_values = [0, 0, 0, 0]
+        rect_space = "unavailable"
     else:
         rect_values = [rect.left, rect.top, rect.right, rect.bottom]
+        after_space = rect_coordinate_space(user32)
+        rect_space = before_space if before_space == after_space else "win32_screen_unknown"
     return {
         "hwnd": int(hwnd),
         "pid": int(pid.value),
         "title": title.value,
         "rect": rect_values,
+        "rect_format": "left_top_right_bottom",
+        "rect_space": rect_space,
+        "rect_source": "GetWindowRect",
         "visible": bool(user32.IsWindowVisible(handle)),
         "minimized": bool(user32.IsIconic(handle)),
     }
@@ -186,3 +211,27 @@ def window_identity(hwnd: int, expected_pid: int) -> dict:
     creation = process_creation_time(expected_pid)
     check()
     return {"hwnd": int(hwnd), "pid": expected_pid, "process_creation_time": creation}
+
+
+def child_window_identity(host_hwnd: int, host_pid: int, child_hwnd: int, child_pid: int) -> dict:
+    """Bound a native descendant to its OWN process, not necessarily the host PID."""
+    user = _user32()
+    user.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
+    user.IsChild.restype = wintypes.BOOL
+
+    def relation():
+        host = wintypes.DWORD()
+        if (
+            not user.IsWindow(host_hwnd)
+            or not user.GetWindowThreadProcessId(host_hwnd, ctypes.byref(host))
+            or host.value != host_pid
+            or not user.IsChild(host_hwnd, child_hwnd)
+        ):
+            raise TargetError("STALE_TARGET", "Native descendant membership changed")
+
+    relation()
+    identity = window_identity(child_hwnd, child_pid)
+    relation()
+    if identity["process_creation_time"] is None:
+        raise TargetError("IDENTITY_UNAVAILABLE", "Element process identity unavailable")
+    return identity

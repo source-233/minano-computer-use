@@ -20,6 +20,7 @@ from .contracts import (
     UIA_ACTIONS,
     failure_details,
     receipt_facts,
+    require_permission,
     result,
 )
 from .control import OperationCancelled, OperationController
@@ -529,11 +530,9 @@ class Runtime:
                     prepared, native, True, kwargs.get("timeout", 5), operation=operation
                 )
             if action in {"close", "ocr"}:
-                if action == "close" and not (
-                    self.allow_process_control and process_permission is True
-                ):
-                    raise ValueError(
-                        "close requires startup and per-call process-control permission"
+                if action == "close":
+                    require_permission(
+                        "process_control", self.allow_process_control, process_permission
                     )
                 options = {
                     key: value
@@ -1919,8 +1918,7 @@ class Runtime:
         )
 
     def _probe_options(self, probe, allow_shell):
-        if not (self.allow_shell and allow_shell is True):
-            raise ValueError("probe requires startup and per-call shell permission")
+        require_permission("shell", self.allow_shell, allow_shell)
         if isinstance(probe, str):
             probe = {"command": probe}
         if not isinstance(probe, dict) or set(probe) - {"command", "shell_kind", "timeout"}:
@@ -2022,12 +2020,14 @@ class Runtime:
     ):
         def execute(operation):
             validate_budget(max_output_chars, max_output_bytes)
-            if action == "shell" and not (self.allow_shell and kwargs.get("allow_shell") is True):
-                raise ValueError("shell requires startup and per-call permission")
-            if action in {"kill", "terminate"} and not (
-                self.allow_process_control and kwargs.get("allow_process_control") is True
-            ):
-                raise ValueError("process control requires startup and per-call permission")
+            if action == "shell":
+                require_permission("shell", self.allow_shell, kwargs.get("allow_shell"))
+            if action in {"kill", "terminate"}:
+                require_permission(
+                    "process_control",
+                    self.allow_process_control,
+                    kwargs.get("allow_process_control"),
+                )
             try:
                 response = self._automation().process(
                     action,
