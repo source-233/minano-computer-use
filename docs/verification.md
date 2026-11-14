@@ -1,5 +1,73 @@
 # Verification evidence and limits
 
+## 0.5.4: English agent workflow guidance
+
+This documentation-only follow-up puts orchestration rules ahead of low-frequency
+details. MCP initialization now supplies brief English workflow instructions; act
+and screenshot also carry their observation-reuse rules at the top, so clients
+that do not surface initialization instructions still receive the key guidance.
+Tool and parameter text explains default per-mode observation, one-call UIA image
+requests, decision boundaries, conditional waits, exact image-coordinate binding,
+and independent action/observation evidence. Three complete call examples cover
+UIA, native and background message modes. No runtime behavior, argument defaults,
+permissions, response fields or tool count is changed.
+
+Reference selection, observed 2026-11-15:
+
+- The currently connected Context7 definitions make prerequisites and their explicit
+  exceptions prominent. Minano adopts this writing pattern, not its library-ID
+  workflow or arbitrary per-question call limit.
+- The connected gh_grep definition distinguishes good and bad queries with concrete
+  examples. Minano uses complete calls and direct warnings against routine duplicate
+  observation, rather than adding more abstract parameter prose.
+- [Cua Driver batching reference](https://cua.ai/docs/cua-driver/reference/mcp-tools/batch-recording-and-settings)
+  leads with a known sequence plus observation in one response. This is a rolling
+  official description, not evidence about a locally installed Cua release. The
+  [agent skill pinned at e97749d](https://github.com/trycua/cua/blob/e97749d219d771b0106ce6eaa892912f5f44202c/libs/cua/skills/cua-driver/SKILL.md)
+  separates workflow, refusal recovery and on-demand detail. Minano does not adopt
+  Cua's token re-search/retry, foreground fallback, snapshot-lifetime semantics,
+  browser tools or arbitrary script execution.
+
+Verification reads the actual initialize response and tools/list, checks English
+descriptions without constraining application/user text, and extracts the published
+complete examples for schema plus effect-free Runtime prevalidation. AST comparison
+against 1762571 confirms all seven tool execution bodies are unchanged; only
+docstrings, schema text and the FastMCP initialization instructions are different.
+This establishes publication and contract consistency, not that every model will
+follow the instructions or that redundant calls have been empirically eliminated.
+The subsequent compression pass removes repeated workflow prose, not schema
+structure, defaults, enums, examples or annotations. Comparing actual tools/list
+before/after with descriptions removed gives identical contracts; the seven tool
+execution bodies are also unchanged. Character counts (not model-token estimates):
+
+| Published surface | Before compression | After compression | Reduction |
+| --- | ---: | ---: | ---: |
+| Initialization instructions | 2056 | 1067 | 48.1% |
+| Seven tool descriptions | 9094 | 6693 | 26.4% |
+| Instructions + all descriptions, including parameter/action schema text | 34399 | 29139 | 15.3% |
+| Compact serialized tools/list definitions, including structural schema | 69108 | 64799 | 6.2% |
+
+Regression budgets bound instructions to 1100 characters, each tool description to
+1600, seven descriptions to 7000, and instructions plus all published descriptions
+to 30000. The screenshot-reuse rules remain near the start of act/screenshot, and
+all three complete mode examples remain executable-schema/prevalidation fixtures.
+The comparison report is `.artifacts/guidance-compression.json`; no tokenizer or
+live model was used to infer an attention or call-efficiency improvement.
+
+Automated gate: **1356 tests**, including 61 tool-definition checks, Ruff check/format,
+real stdio initialization/discovery, lock validation and wheel/source build pass.
+No user desktop input is part of this release verification.
+
+The 0.5.4 wheel was installed into the global non-editable uv tool environment after
+preserving the installed 0.5.3 package, its verified rollback wheel and configuration.
+An isolated import matched all 28 source modules. Installed-Python stdio and a
+separate installed-executable initialization/discovery check both passed: the 1067
+character instructions and all seven definitions match the verified source, and
+status reports 0.5.4 with strict UIA default and shell/process-control gates off.
+Reports are in `.artifacts/installed-0.5.4/`. The global configuration was restored
+byte-identically, including the existing output directory. No screenshots, user-app
+mutations or real input were needed for deployment verification.
+
 ## 0.5.3: hosted UIA, permission diagnostics and rectangle spaces
 
 Issues #1/#2 and the remaining metadata suggestion from withdrawn #3 are addressed

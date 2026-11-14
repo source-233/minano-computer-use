@@ -10,6 +10,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from minano_computer_use import __version__
+from minano_computer_use.tool_schema import SERVER_INSTRUCTIONS
 
 
 async def main() -> None:
@@ -29,6 +30,8 @@ async def main() -> None:
                 read_timeout_seconds=timedelta(seconds=15),
             ) as client:
                 initialized = await client.initialize()
+                assert initialized.instructions == SERVER_INSTRUCTIONS
+                assert initialized.instructions.isascii()
                 tools = await client.list_tools()
                 names = sorted(tool.name for tool in tools.tools)
                 assert names == [
@@ -49,6 +52,9 @@ async def main() -> None:
                 )
                 assert schemas["window"]["capture_mode"]["default"] == "screen"
                 assert schemas["window"]["allow_fallback"]["default"] is False
+                descriptions = {tool.name: tool.description for tool in tools.tools}
+                assert "do not routinely call screenshot next" in descriptions["act"][:250]
+                assert "Do NOT call this routinely after act" in descriptions["screenshot"][:250]
                 assert all("ctx" not in schema for schema in schemas.values())
                 for name, fields in schemas.items():
                     assert all(item.get("description") for item in fields.values()), name
@@ -95,6 +101,7 @@ async def main() -> None:
                 report = {
                     "server": initialized.serverInfo.model_dump(mode="json"),
                     "protocol_version": initialized.protocolVersion,
+                    "instructions": initialized.instructions,
                     "tools": names,
                     "tool_definitions": [
                         tool.model_dump(mode="json", exclude_none=True) for tool in tools.tools
