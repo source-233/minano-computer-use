@@ -50,6 +50,13 @@ async def main() -> None:
                 assert schemas["window"]["capture_mode"]["default"] == "screen"
                 assert schemas["window"]["allow_fallback"]["default"] is False
                 assert all("ctx" not in schema for schema in schemas.values())
+                for name, fields in schemas.items():
+                    assert all(item.get("description") for item in fields.values()), name
+                assert schemas["play"]["seconds"]["maximum"] == 30
+                action_shape = schemas["play"]["actions"]["anyOf"][0]["items"]
+                assert action_shape["properties"]["at"]["maximum"] == 60
+                assert action_shape["properties"]["key"]["description"]
+                assert "set_clipboard" in schemas["system"]["action"]["enum"]
                 status = await client.call_tool("system", {"action": "status"})
                 assert not status.isError, status
                 assert status.structuredContent is not None
@@ -89,6 +96,10 @@ async def main() -> None:
                     "server": initialized.serverInfo.model_dump(mode="json"),
                     "protocol_version": initialized.protocolVersion,
                     "tools": names,
+                    "tool_definitions": [
+                        tool.model_dump(mode="json", exclude_none=True) for tool in tools.tools
+                    ],
+                    "documented_parameters": sum(len(fields) for fields in schemas.values()),
                     "status": status.model_dump(mode="json"),
                     "window_count": len(windows.structuredContent["data"]),
                     "native_refusal": refused.model_dump(mode="json"),

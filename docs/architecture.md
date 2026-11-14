@@ -51,6 +51,9 @@ below is historical where superseded by parity.md.
 - `runtime.py`: serialization, validation, ordered batches, result aggregation, play orchestration.
 - `server.py`: seven MCP tools `window`, `act`, `screenshot`, `record`, `play`, `process`, `system`;
   clean stdio, CLI. Transport does not implement backend policy.
+- `tool_schema.py`: agent-facing parameter descriptions and JSON Schema structures for
+  existing inputs; no Windows access, authorization, runtime defaults, or input execution.
+  Schema metadata must not coerce/drop action fields or bypass whole-plan validation.
 
 ## Stable Python interfaces for parallel implementation
 

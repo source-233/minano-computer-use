@@ -11,6 +11,7 @@ import weakref
 from contextlib import asynccontextmanager
 from importlib.metadata import version
 from pathlib import Path
+from typing import Annotated
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP, Image
@@ -19,6 +20,7 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from .contracts import STOP_STATUSES
 from .output import bound_result
 from .runtime import Runtime
+from .tool_schema import parameter
 from .wire import public_result
 
 
@@ -126,49 +128,58 @@ def create_server(
 
     @app.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
     async def window(
-        action: str = "list",
-        target: str | None = None,
-        selector: str | dict | None = None,
-        value: str | None = None,
-        depth: int = 8,
-        max_nodes: int = 500,
-        timeout: float = 5.0,
-        direction: str | None = None,
-        amount: str | None = None,
-        query: str | None = None,
-        match: str = "contains",
-        limit: int | None = None,
-        compact: bool = False,
-        include_tokens: bool = False,
-        token: str | None = None,
-        condition: dict | None = None,
-        poll_interval: float = 0.05,
-        max_output_chars: int = 24000,
-        max_output_bytes: int = 65536,
-        window: str | None = None,
-        role: str | None = None,
-        nth: int | None = None,
-        native: bool = False,
-        allow_process_control: bool = False,
-        details: bool = False,
-        rich: bool | None = None,
-        text_limit: int | None = None,
-        include_ax: bool = True,
-        include_screenshot: bool = True,
-        max_dim: int = 800,
-        format: str = "jpeg",
-        quality: int = 75,
-        capture_mode: str = "screen",
-        allow_fallback: bool = False,
+        action: Annotated[str, parameter("window", "action")] = "list",
+        target: Annotated[str | None, parameter("window", "target")] = None,
+        selector: Annotated[str | dict | None, parameter("window", "selector")] = None,
+        value: Annotated[str | None, parameter("window", "value")] = None,
+        depth: Annotated[int, parameter("window", "depth")] = 8,
+        max_nodes: Annotated[int, parameter("window", "max_nodes")] = 500,
+        timeout: Annotated[float, parameter("window", "timeout")] = 5.0,
+        direction: Annotated[str | None, parameter("window", "direction")] = None,
+        amount: Annotated[str | None, parameter("window", "amount")] = None,
+        query: Annotated[str | None, parameter("window", "query")] = None,
+        match: Annotated[str, parameter("window", "match")] = "contains",
+        limit: Annotated[int | None, parameter("window", "limit")] = None,
+        compact: Annotated[bool, parameter("window", "compact")] = False,
+        include_tokens: Annotated[bool, parameter("window", "include_tokens")] = False,
+        token: Annotated[str | None, parameter("window", "token")] = None,
+        condition: Annotated[dict | None, parameter("window", "condition")] = None,
+        poll_interval: Annotated[float, parameter("window", "poll_interval")] = 0.05,
+        max_output_chars: Annotated[int, parameter("window", "max_output_chars")] = 24000,
+        max_output_bytes: Annotated[int, parameter("window", "max_output_bytes")] = 65536,
+        window: Annotated[str | None, parameter("window", "window")] = None,
+        role: Annotated[str | None, parameter("window", "role")] = None,
+        nth: Annotated[int | None, parameter("window", "nth")] = None,
+        native: Annotated[bool, parameter("window", "native")] = False,
+        allow_process_control: Annotated[
+            bool, parameter("window", "allow_process_control")
+        ] = False,
+        details: Annotated[bool, parameter("window", "details")] = False,
+        rich: Annotated[bool | None, parameter("window", "rich")] = None,
+        text_limit: Annotated[int | None, parameter("window", "text_limit")] = None,
+        include_ax: Annotated[bool, parameter("window", "include_ax")] = True,
+        include_screenshot: Annotated[bool, parameter("window", "include_screenshot")] = True,
+        max_dim: Annotated[int, parameter("window", "max_dim")] = 800,
+        format: Annotated[str, parameter("window", "format")] = "jpeg",
+        quality: Annotated[int, parameter("window", "quality")] = 75,
+        capture_mode: Annotated[str, parameter("window", "capture_mode")] = "screen",
+        allow_fallback: Annotated[bool, parameter("window", "allow_fallback")] = False,
         ctx: Context = None,
     ) -> CallToolResult:
-        """List/read windows or use semantic UIA patterns; never physically falls back.
+        """Discover Windows windows/controls, read state, or perform one semantic UIA action.
 
-        state accepts capture_mode/allow_fallback for its independent image component;
-        defaults remain screen/false. No focus activation; components are non-atomic.
-        include_tokens=True adds bounded, expiring node tokens usable by later UIA actions.
-        UIA set_value writes once, then checks that same live element for at most 600ms
-        within the remaining call deadline; it never searches again or repeats the write.
+        Start with list, then state/find/inspect for a concrete target and selector/token.
+        Example: {"action":"state","target":"hwnd:0x123","include_tokens":true}.
+        Use act for ordered batches, screenshot for an image only, process for lifecycle.
+        invoke/set_value/toggle/select/expand/collapse/scroll modify the application;
+        close may lose unsaved work and needs both process-control permissions.
+        UIA never falls back to real input; only explicit native focus/force_focus
+        activates. Providers can independently change focus. Unsupported/ambiguous
+        controls refuse. set_value writes once, confirms the same reference <=600ms
+        within timeout, and never re-searches or replays a write.
+        Returns bounded JSON status/operation/data/error plus optional image. State
+        includes independently timed UIA/image components and partial errors, not an
+        atomic frame. Tokens expire; node indexes are not safe action references.
         """
         kwargs = dict(
             depth=depth,
@@ -231,35 +242,40 @@ def create_server(
 
     @app.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
     async def act(
-        actions: list[dict],
-        target: str | None = None,
-        native: bool = False,
-        stop_on_error: bool = True,
-        timeout: float = 5.0,
-        max_output_chars: int = 24000,
-        max_output_bytes: int = 65536,
-        coordinate_space: str = "screen",
-        capture_id: str | None = None,
-        screenshot: bool | str = "auto",
-        settle_ms: float = 80,
-        focus: bool | str | None = None,
-        key_method: str = "scancode",
-        input_mode: str | None = None,
-        feedback: str = "compact",
+        actions: Annotated[list[dict], parameter("act", "actions")],
+        target: Annotated[str | None, parameter("act", "target")] = None,
+        native: Annotated[bool, parameter("act", "native")] = False,
+        stop_on_error: Annotated[bool, parameter("act", "stop_on_error")] = True,
+        timeout: Annotated[float, parameter("act", "timeout")] = 5.0,
+        max_output_chars: Annotated[int, parameter("act", "max_output_chars")] = 24000,
+        max_output_bytes: Annotated[int, parameter("act", "max_output_bytes")] = 65536,
+        coordinate_space: Annotated[str, parameter("act", "coordinate_space")] = "screen",
+        capture_id: Annotated[str | None, parameter("act", "capture_id")] = None,
+        screenshot: Annotated[bool | str, parameter("act", "screenshot")] = "auto",
+        settle_ms: Annotated[float, parameter("act", "settle_ms")] = 80,
+        focus: Annotated[bool | str | None, parameter("act", "focus")] = None,
+        key_method: Annotated[str, parameter("act", "key_method")] = "scancode",
+        input_mode: Annotated[str | None, parameter("act", "input_mode")] = None,
+        feedback: Annotated[str, parameter("act", "feedback")] = "compact",
         ctx: Context = None,
     ) -> CallToolResult:
-        """Run ordered actions with uia, native, or background message input_mode.
+        """Execute 1..100 ordered Windows control/input actions with optional final observation.
 
-        Omitted input_mode preserves native=false/true. Explicit native or message
-        mode opts in alone; native=true conflicts with explicit uia/message.
-
-        Explicit native force_focus restores/attaches input threads and verifies the exact
-        foreground HWND; focus keeps conservative SetForegroundWindow behavior. Neither
-        is automatically used before keyboard or mouse actions.
-        Auto feedback returns full state for message, an image for native, text for UIA;
-        screenshot=false disables feedback. Observation does not verify game effects.
-        feedback=compact/detailed controls native receipt/context metadata only,
-        independently of screenshot; it does not select another input channel.
+        Use window to discover exact selectors/tokens first; use play for at-timestamp
+        scheduling with recording, record for observation without actions.
+        UIA example: actions=[{"action":"invoke","selector":{"automation_id":"ok"}}].
+        Native example: native=true, actions=[{"action":"hold","key":"W","seconds":0.2}].
+        Default strict UIA never falls back. native=true or input_mode=native selects
+        real input; message explicitly selects background HWND messages. native=true
+        conflicts with explicit uia/message. Native requires foreground; force_focus
+        or focus must be explicit (focus argument is a force_focus shortcut).
+        Validate the whole plan first; no rollback of earlier effects. Stop on errors
+        by default and attempt release of tool-owned held inputs. Loss/timeout may
+        have acted: inspect indexed results, counts, receipts and cleanup; never replay.
+        Returns JSON plus auto-observation: UIA text/native image/message state.
+        screenshot=false disables observation; feedback controls native metadata only.
+        Observation failure cannot change primary results; system acceptance does not
+        verify game consumption. Unsupported UIA controls need explicit channel choice.
         """
         return _response(
             await invoke(
@@ -288,23 +304,36 @@ def create_server(
 
     @app.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
     async def screenshot(
-        target: str = "desktop",
-        max_dim: int = 800,
-        format: str = "jpeg",
-        region: list[int] | dict | None = None,
-        capture_mode: str = "screen",
-        allow_fallback: bool = False,
-        timeout: float = 5.0,
-        max_output_chars: int = 24000,
-        max_output_bytes: int = 65536,
-        region_space: str = "surface",
-        save: bool = False,
-        define_viewport: str | None = None,
-        foreground: bool = False,
-        quality: int = 75,
+        target: Annotated[str, parameter("screenshot", "target")] = "desktop",
+        max_dim: Annotated[int, parameter("screenshot", "max_dim")] = 800,
+        format: Annotated[str, parameter("screenshot", "format")] = "jpeg",
+        region: Annotated[list[int] | dict | None, parameter("screenshot", "region")] = None,
+        capture_mode: Annotated[str, parameter("screenshot", "capture_mode")] = "screen",
+        allow_fallback: Annotated[bool, parameter("screenshot", "allow_fallback")] = False,
+        timeout: Annotated[float, parameter("screenshot", "timeout")] = 5.0,
+        max_output_chars: Annotated[int, parameter("screenshot", "max_output_chars")] = 24000,
+        max_output_bytes: Annotated[int, parameter("screenshot", "max_output_bytes")] = 65536,
+        region_space: Annotated[str, parameter("screenshot", "region_space")] = "surface",
+        save: Annotated[bool, parameter("screenshot", "save")] = False,
+        define_viewport: Annotated[str | None, parameter("screenshot", "define_viewport")] = None,
+        foreground: Annotated[bool, parameter("screenshot", "foreground")] = False,
+        quality: Annotated[int, parameter("screenshot", "quality")] = 75,
         ctx: Context = None,
     ) -> CallToolResult:
-        """Return a screen-composite MCP image, separately from JSON metadata."""
+        """Capture one desktop/display/window/crop image without injecting input or activating.
+
+        Use this for pixels only, window(action=state) for UIA plus an image, record
+        for a time series, or play for actions plus recording. Default desktop screen
+        capture includes visible occluders; explicit window backends may fail and do
+        not fall back to screen unless allow_fallback=true. WGC is optional.
+        Returns an MCP image plus separate bounded JSON metadata: backend, source and
+        output geometry, transform, capture_id, timestamps, and optional artifact path.
+        Example: {"target":"hwnd:0x123","capture_mode":"printwindow","save":true}.
+        save persists the original locally; define_viewport changes only the client
+        crop registry. Images can contain sensitive pixels despite UIA text redaction.
+        For subsequent image-coordinate input, pass capture_id and an explicit window;
+        invalid identity/transform refuses, never guesses or clamps a click.
+        """
         return _response(
             await invoke(
                 owned.screenshot,
@@ -331,23 +360,36 @@ def create_server(
 
     @app.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
     async def record(
-        target: str = "desktop",
-        seconds: float = 3.0,
-        fps: float = 10,
-        montage_frames: int = 6,
-        max_output_chars: int = 24000,
-        max_output_bytes: int = 65536,
-        region: list[int] | dict | None = None,
-        region_space: str = "surface",
-        keep_frames: bool = False,
-        capture_mode: str = "screen",
-        foreground: bool = False,
-        max_dim: int = 800,
-        format: str = "jpeg",
-        quality: int = 75,
+        target: Annotated[str, parameter("record", "target")] = "desktop",
+        seconds: Annotated[float, parameter("record", "seconds")] = 3.0,
+        fps: Annotated[float, parameter("record", "fps")] = 10,
+        montage_frames: Annotated[int, parameter("record", "montage_frames")] = 6,
+        max_output_chars: Annotated[int, parameter("record", "max_output_chars")] = 24000,
+        max_output_bytes: Annotated[int, parameter("record", "max_output_bytes")] = 65536,
+        region: Annotated[list[int] | dict | None, parameter("record", "region")] = None,
+        region_space: Annotated[str, parameter("record", "region_space")] = "surface",
+        keep_frames: Annotated[bool, parameter("record", "keep_frames")] = False,
+        capture_mode: Annotated[str, parameter("record", "capture_mode")] = "screen",
+        foreground: Annotated[bool, parameter("record", "foreground")] = False,
+        max_dim: Annotated[int, parameter("record", "max_dim")] = 800,
+        format: Annotated[str, parameter("record", "format")] = "jpeg",
+        quality: Annotated[int, parameter("record", "quality")] = 75,
         ctx: Context = None,
     ) -> CallToolResult:
-        """Bounded screen recording and timestamped montage; no focus activation."""
+        """Observe 0.05..60 seconds of screen/window activity without executing actions.
+
+        Use screenshot for one frame, play for actions with capture. No focus/input
+        changes; screen mode may record occluders. Example: {"target":"desktop",
+        "seconds":3,"fps":5,"montage_frames":4}. Limits include duration, memory and
+        managed artifact quota; unsupported backend/identity failure is reported.
+        Returns timestamped MCP montage plus JSON sample times, achieved_fps, backend,
+        local H.264 MP4 path or encoding warning, and optional PNG-frame/index paths.
+        Encoding uses an isolated PyAV worker; no external ffmpeg executable. Artifacts
+        may contain sensitive pixels and are quota-managed; montage resize never
+        downscales video/original frames. Montages do not establish click coordinates
+        or exact game-frame/action pairing. Cancellation requests stop sampling and
+        encoding with cleanup, not rollback of already-saved artifacts.
+        """
         return _response(
             await invoke(
                 owned.record,
@@ -374,33 +416,50 @@ def create_server(
 
     @app.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
     async def play(
-        actions: list[dict] | None = None,
-        target: str | None = None,
-        native: bool = False,
-        seconds: float = 3.0,
-        fps: float = 10,
-        stop_on_error: bool = True,
-        timeout: float = 5.0,
-        max_output_chars: int = 24000,
-        max_output_bytes: int = 65536,
-        script: str | None = None,
-        montage_frames: int = 6,
-        probe: str | dict | None = None,
-        coordinate_space: str = "screen",
-        capture_id: str | None = None,
-        key_method: str = "scancode",
-        allow_shell: bool = False,
-        max_dim: int = 800,
-        format: str = "jpeg",
-        quality: int = 75,
-        input_mode: str | None = None,
-        feedback: str = "compact",
+        actions: Annotated[list[dict] | None, parameter("play", "actions")] = None,
+        target: Annotated[str | None, parameter("play", "target")] = None,
+        native: Annotated[bool, parameter("play", "native")] = False,
+        seconds: Annotated[float, parameter("play", "seconds")] = 3.0,
+        fps: Annotated[float, parameter("play", "fps")] = 10,
+        stop_on_error: Annotated[bool, parameter("play", "stop_on_error")] = True,
+        timeout: Annotated[float, parameter("play", "timeout")] = 5.0,
+        max_output_chars: Annotated[int, parameter("play", "max_output_chars")] = 24000,
+        max_output_bytes: Annotated[int, parameter("play", "max_output_bytes")] = 65536,
+        script: Annotated[str | None, parameter("play", "script")] = None,
+        montage_frames: Annotated[int, parameter("play", "montage_frames")] = 6,
+        probe: Annotated[str | dict | None, parameter("play", "probe")] = None,
+        coordinate_space: Annotated[str, parameter("play", "coordinate_space")] = "screen",
+        capture_id: Annotated[str | None, parameter("play", "capture_id")] = None,
+        key_method: Annotated[str, parameter("play", "key_method")] = "scancode",
+        allow_shell: Annotated[bool, parameter("play", "allow_shell")] = False,
+        max_dim: Annotated[int, parameter("play", "max_dim")] = 800,
+        format: Annotated[str, parameter("play", "format")] = "jpeg",
+        quality: Annotated[int, parameter("play", "quality")] = 75,
+        input_mode: Annotated[str | None, parameter("play", "input_mode")] = None,
+        feedback: Annotated[str, parameter("play", "feedback")] = "compact",
         ctx: Context = None,
     ) -> CallToolResult:
-        """Timed actions (at seconds) alongside capture; no strict frame/action pairing.
+        """Run a bounded Windows action sequence while recording independent visual samples.
 
-        feedback=compact/detailed controls native receipt/context metadata only;
-        it never changes input mode or recording behavior.
+        Choose play for at-timed actions or sequential DSL with recording; use act
+        for ordinary batches/final feedback, record for no-input observation.
+        Exactly one of actions/script is required; max100 expanded actions. seconds
+        is 0.1..30, at is relative to this call, nondecreasing, and <=seconds (not an
+        absolute/global timeline). Actions run sequentially; late ones run immediately.
+        The key/mouse DSL needs explicit native or message mode; UIA uses actions.
+        Example: {"target":"hwnd:0x123","native":true,"seconds":2,"actions":[
+        {"at":0,"action":"hold","key":"W","seconds":0.2}]}.
+        Defaults to strict UIA. Native touches real input and requires foreground;
+        focus/force_focus must be explicit, loss stops by default, never auto-refocus.
+        Message mode is explicit background delivery, not a game-input bypass.
+        probe/until executes a shell command only with --allow-shell AND allow_shell.
+        Validate the whole plan first; partial effects are not rolled back/replayed.
+        Returns JSON data.actions.data results/counts/cleanup separately from data.capture
+        errors/metadata and optional montage/MP4 paths. Capture failure does not prove
+        action failure, a missing window does not prove process exit, and accepted
+        events do not prove game consumption. No strict frame/action pairing.
+        Cancellation signals first; final return follows tool-owned input release
+        attempts and capture/encoder cleanup. feedback controls native metadata only.
         """
         return _response(
             await invoke(
@@ -435,29 +494,46 @@ def create_server(
 
     @app.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
     async def process(
-        action: str = "list",
-        argv: list[str] | None = None,
-        exe: str | None = None,
-        args: list[str] | None = None,
-        cwd: str | None = None,
-        shell: bool = False,
-        command: str | None = None,
-        timeout: float = 10,
-        pid: int | None = None,
-        name: str | None = None,
-        target: str | None = None,
-        all: bool = False,
-        dir: str | None = None,
-        glob: str | None = None,
-        query: str | None = None,
-        ready: str = "exists",
-        shell_kind: str = "powershell",
-        allow_shell: bool = False,
-        allow_process_control: bool = False,
-        max_output_chars: int = 24000,
-        max_output_bytes: int = 65536,
+        action: Annotated[str, parameter("process", "action")] = "list",
+        argv: Annotated[list[str] | None, parameter("process", "argv")] = None,
+        exe: Annotated[str | None, parameter("process", "exe")] = None,
+        args: Annotated[list[str] | None, parameter("process", "args")] = None,
+        cwd: Annotated[str | None, parameter("process", "cwd")] = None,
+        shell: Annotated[bool, parameter("process", "shell")] = False,
+        command: Annotated[str | None, parameter("process", "command")] = None,
+        timeout: Annotated[float, parameter("process", "timeout")] = 10,
+        pid: Annotated[int | None, parameter("process", "pid")] = None,
+        name: Annotated[str | None, parameter("process", "name")] = None,
+        target: Annotated[str | None, parameter("process", "target")] = None,
+        all: Annotated[bool, parameter("process", "all")] = False,
+        dir: Annotated[str | None, parameter("process", "dir")] = None,
+        glob: Annotated[str | None, parameter("process", "glob")] = None,
+        query: Annotated[str | None, parameter("process", "query")] = None,
+        ready: Annotated[str, parameter("process", "ready")] = "exists",
+        shell_kind: Annotated[str, parameter("process", "shell_kind")] = "powershell",
+        allow_shell: Annotated[bool, parameter("process", "allow_shell")] = False,
+        allow_process_control: Annotated[
+            bool, parameter("process", "allow_process_control")
+        ] = False,
+        max_output_chars: Annotated[int, parameter("process", "max_output_chars")] = 24000,
+        max_output_bytes: Annotated[int, parameter("process", "max_output_bytes")] = 65536,
     ) -> CallToolResult:
-        """Process inventory, launch and waits; shell/control require startup AND call opt-ins."""
+        """List/start Windows programs, wait for lifecycle/readiness, or explicitly run/kill.
+
+        Use window for controls, act/play for input, system for the MCP's own status.
+        Default list is read-only; launch starts a program without promising focus or
+        readiness. Example: {"action":"launch","argv":["notepad.exe"]}; then explicitly
+        wait_for_window if needed. wait binds process handles and reports exit codes;
+        window lookup failure alone is not process-exit evidence. wait_for_file ignores
+        files existing at call start and requires a new file stable for >=200ms.
+        shell executes arbitrary commands with current user rights: needs --allow-shell
+        AND allow_shell=true. kill irreversibly terminates processes and may lose work:
+        needs --allow-process-control AND allow_process_control=true. Protected server/
+        worker processes refuse; ambiguity refuses unless explicitly all=true.
+        Returns bounded JSON inventory, launched identity, readiness/exit evidence, or
+        shell exit_code/stdout/stderr (potentially sensitive/truncated). Timeout/cancel
+        may follow effects; never automatically rerun a launch/command/kill.
+        """
         return _response(
             await invoke(
                 owned.process,
@@ -490,12 +566,25 @@ def create_server(
 
     @app.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
     async def system(
-        action: str = "status",
-        text: str | None = None,
-        name: str | None = None,
+        action: Annotated[str, parameter("system", "action")] = "status",
+        text: Annotated[str | None, parameter("system", "text")] = None,
+        name: Annotated[str | None, parameter("system", "name")] = None,
         ctx: Context = None,
     ) -> CallToolResult:
-        """Read status/displays or request cancellation (acceptance is not cleanup)."""
+        """Read MCP/desktop/clipboard state, cancel active work, or manage named crops.
+
+        Use status to identify the RUNNING server/version and active operation; process
+        inventories applications, not this service's execution state. Example:
+        {"action":"status"}, {"action":"get_clipboard"}, {"action":"clear_viewport","name":"panel"}.
+        cancel signals the current operation without waiting behind its execution lock;
+        accepted cancellation does NOT mean input was released or work rolled back.
+        Await the original call's final cleanup evidence; don't replay pending actions.
+        displays/cursor only observe. get_clipboard reads sensitive Unicode text;
+        set_clipboard replaces system clipboard text and may discard non-text formats.
+        viewports lists this client's crop bindings; clear_viewport removes one, not
+        an OS window. Returns bounded JSON status/data/error, never screenshots or
+        physical input; unsupported actions refuse rather than executing commands.
+        """
         # This is deliberately a direct fast path: cancel must not wait for the executor.
         if action in {"cancel", "status"}:
             return _response(owned.system(action), "system")

@@ -1,5 +1,38 @@
 # Verification evidence and limits
 
+## 0.5.2 tool-definition usability
+
+The seven existing tools now describe all 122 public parameters, their valid values,
+units, important defaults and interactions. `actions`, selector, wait condition,
+region and probe objects have documented JSON Schema structure. Tool descriptions
+state routing, prerequisites, side effects, return evidence and failure boundaries.
+In particular, play documents its 30-second recording limit, relative/nondecreasing
+`at <= seconds`, actions/script choice, foreground checks and independent action/
+capture results. This does not extend play duration, permissions or backends.
+
+Metadata uses `Annotated` plus Pydantic Field JSON Schema extras, preserving the
+existing argument types, defaults and Runtime whole-plan validation. No action
+model drops unknown fields, inserts input defaults or converts a refusal into a
+successful no-op. Comparing the tool execution bodies as ASTs against `7a4bbcb`
+confirmed all seven bodies are unchanged (excluding annotations/docstrings).
+
+Evidence: 54 definition-specific tests validate all published schemas and parameter
+defaults, canonical/legacy examples, bounded definitions, key constraints and
+pre-effect refusals through the real MCP in-memory transport. The full regression
+suite passes **1291 tests**; Ruff check/format, stdio, lock validation and wheel/source
+build pass. The updated `.artifacts/stdio-smoke.json` includes the full definitions
+and parameter-coverage count. No new third-party TDQS score is claimed; no paid or
+authenticated scoring endpoint was called. No real input or new game/UIA-provider
+compatibility claim was needed for metadata-only changes.
+
+The 0.5.2 wheel was installed globally after preserving the prior wheel/config.
+An isolated import from the uv tool environment matched all 27 package modules to
+the verified source. Installed-Python stdio and feedback round-trips exited 0; all
+seven installed `tools/list` definitions match the source report, with all 122
+parameters described. The reconnected live `system.status` reports 0.5.2, strict UIA
+default, and shell/process-control gates disabled. Global configuration was restored
+byte-identically. Installed reports are in `.artifacts/installed-0.5.2/`.
+
 ## 0.5.1 UIA token and write confirmation
 
 This release adds bounded actionable tokens to `state(include_tokens=true)` and
